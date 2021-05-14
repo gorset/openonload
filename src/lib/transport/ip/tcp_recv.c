@@ -72,35 +72,6 @@ ci_tcp_recv_fill_msgname(ci_tcp_state* ts, struct sockaddr *name,
 }
 
 
-int ci_tcp_send_wnd_update(ci_netif* ni, ci_tcp_state* ts, int sock_locked)
-{
-  ci_assert(ci_netif_is_locked(ni));
-
-  if(CI_UNLIKELY( ! (ts->s.b.state & CI_TCP_STATE_ACCEPT_DATA) ))
-    return 0;
-
-  ci_assert_lt(ci_tcp_ack_trigger_delta(ts), ci_tcp_max_rcv_window(ts));
-
-  if( SEQ_SUB(ts->rcv_delivered + ci_tcp_max_rcv_window(ts),
-              tcp_rcv_wnd_right_edge_sent(ts))
-      >= ci_tcp_ack_trigger_delta(ts) ) {
-    ci_ip_pkt_fmt* pkt = ci_netif_pkt_alloc(ni, 0);
-    if( pkt ) {
-      LOG_TR(log(LNTS_FMT "window update advertised=%d",
-                 LNTS_PRI_ARGS(ni, ts), tcp_rcv_wnd_advertised(ts)));
-      CITP_STATS_NETIF_INC(ni, wnd_updates_sent);
-      ci_tcp_send_ack_rx(ni, ts, pkt, sock_locked, CI_TRUE);
-      /* Update the ack trigger so we won't attempt to send another windows
-      ** update for a while.
-      */
-      ts->ack_trigger += ci_tcp_ack_trigger_delta(ts);
-      return 1;
-    }
-  }
-  return 0;
-}
-
-
 /* This is called after we've pulled a certain amount of data from the
 ** receive queue, and sends a window update if appropriate.
 */
@@ -232,9 +203,6 @@ ci_tcp_recvmsg_get_nopeek(int peek_off, ci_tcp_state *ts, ci_netif *netif,
     /* for now run every time we update rcv_delivered */
     ci_tcp_rcvbuf_drs(netif, ts);
   if( oo_offbuf_left(&(*pkt)->buf) == 0 ) {
-    /* We've emptied the current packet. */
-    if( CI_UNLIKELY(SEQ_LE(ts->ack_trigger, ts->rcv_delivered)) )
-      ci_tcp_recvmsg_send_wnd_update(netif, ts);
     if( total == max_bytes || OO_PP_IS_NULL((*pkt)->next) )
       /* We've emptied the receive queue. Return non-zero to report this
        * to the calling function, so that it can return appropriately. */
@@ -308,6 +276,7 @@ ci_tcp_recvmsg_get(struct tcp_recv_info *rinf)
   int n, peek_off, total;
   ci_ip_pkt_fmt* pkt;
   int max_bytes;
+  oo_pkt_p initial_recv1_extract;
 
   ci_assert(netif);
   ci_assert(ts);
@@ -335,6 +304,7 @@ ci_tcp_recvmsg_get(struct tcp_recv_info *rinf)
     pkt = PKT_CHK_NNL(netif, ts->recv1_extract);
     ci_assert(oo_offbuf_not_empty(&pkt->buf));
   }
+  initial_recv1_extract = ts->recv1_extract;
 
   /* Intention is to return the timestamp from the first packet seen, when
    * ci_tcp_recvmsg_get could be called multiple times; so only update
@@ -371,7 +341,7 @@ ci_tcp_recvmsg_get(struct tcp_recv_info *rinf)
       CI_IOVEC_LEN(&rinf->piov.io) -= n;
     }
 #ifdef  __KERNEL__
-    if( n < 0 )  return total;
+    if( n < 0 )  break;
 #endif
 
     total += n;
@@ -380,7 +350,7 @@ ci_tcp_recvmsg_get(struct tcp_recv_info *rinf)
     if(CI_LIKELY( ! (rinf->a->flags & (MSG_PEEK | ONLOAD_MSG_ONEPKT)) )) {
       if( ci_tcp_recvmsg_get_nopeek(peek_off, ts, netif, &pkt, total, n,
                                     max_bytes, rinf) != 0 )
-        return total;
+        break;
     }
     else {
       if( rinf->a->flags & MSG_PEEK ) {
@@ -401,16 +371,17 @@ ci_tcp_recvmsg_get(struct tcp_recv_info *rinf)
       else {
         if( ci_tcp_recvmsg_get_nopeek(peek_off, ts, netif, &pkt, total, n,
                                       max_bytes, rinf) != 0 )
-          return total;
+          break;
       }
 
       if( rinf->a->flags & ONLOAD_MSG_ONEPKT )
-        return total;
+        break;
     }
 
     if( CI_IOVEC_LEN(&rinf->piov.io) == 0 ) {
       /* Exit here if we've filled the app's buffer. */
-      if( rinf->piov.iovlen == 0 )  return total;
+      if( rinf->piov.iovlen == 0 )
+        break;
       rinf->piov.io = *(rinf->piov.iov)++;
       --rinf->piov.iovlen;
     }
@@ -421,6 +392,13 @@ ci_tcp_recvmsg_get(struct tcp_recv_info *rinf)
     ** comment; darn.
     */
   }
+  /* we do this here as the last thing to avoid sending many small window updates
+   * in cases with small recv window and small segments */
+  if( initial_recv1_extract != ts->recv1_extract &&
+      CI_UNLIKELY(SEQ_LE(ts->ack_trigger, ts->rcv_delivered)) ) {
+    ci_tcp_recvmsg_send_wnd_update(netif, ts);
+  }
+  return total;
 }
 
 
@@ -615,13 +593,8 @@ int ci_tcp_recvmsg(const ci_tcp_recvmsg_args* a)
         else if( any_evs )
           ci_netif_poll(ni);
 	ci_netif_unlock(ni);
-	if( ts->rcv_added != rcv_added_before ) {
-	  if( (flags & MSG_PEEK) ) {
-            ci_iovec_ptr_init_nz(&rinf.piov, a->msg->msg_iov, a->msg->msg_iovlen);
-            rinf.rc = 0;
-          }
+	if( ts->rcv_added != rcv_added_before )
 	  goto poll_recv_queue;
-	}
       }
       else {
         /* The netif lock is contended, so the chances are we're up-to-date.

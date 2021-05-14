@@ -65,6 +65,7 @@
 #include <ci/efrm/pd.h>
 #include <driver/linux_net/filter.h>
 #include <ci/efrm/efrm_filter.h>
+#include <ci/efrm/syscall.h>
 #include <ci/driver/internal.h>
 #include <ci/efhw/falcon.h>
 #include "compat_pat_wc.h"
@@ -169,7 +170,7 @@ static int iomap_bar(struct linux_efhw_nic *lnic, size_t len)
 {
 	volatile char __iomem *ioaddr;
 
-	ioaddr = ioremap_nocache(lnic->efrm_nic.efhw_nic.ctr_ap_dma_addr, len);
+	ioaddr = efx_ioremap(lnic->efrm_nic.efhw_nic.ctr_ap_dma_addr, len);
 	if (ioaddr == 0)
 		return -ENOMEM;
 
@@ -479,13 +480,13 @@ static int efrm_nic_enable_open_proc(struct inode *inode, struct file *file)
 }
 
 
-static const struct file_operations efrm_nic_enable_fops_proc = {
-	.owner		= THIS_MODULE,
-	.open		= efrm_nic_enable_open_proc,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.write      = efrm_nic_enable_write,
-	.release	= single_release,
+static const struct proc_ops efrm_nic_enable_fops_proc = {
+	PROC_OPS_SET_OWNER
+	.proc_open	= efrm_nic_enable_open_proc,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_write     = efrm_nic_enable_write,
+	.proc_release	= single_release,
 };
 
 
@@ -858,6 +859,12 @@ static int init_sfc_resource(void)
 	int rc = 0;
 
 	EFRM_TRACE("%s: RESOURCE driver starting", __func__);
+
+	rc = efrm_syscall_ctor();
+	if( rc != 0 ) {
+		EFRM_ERR("%s: ERROR: failed to find syscall table", __func__);
+		return rc;
+	}
 
 	efrm_driver_ctor();
 	efrm_filter_init();

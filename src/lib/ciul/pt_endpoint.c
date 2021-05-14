@@ -338,7 +338,7 @@ void ef_vi_set_intf_ver(char* intf_ver, size_t len)
    */
   strncpy(intf_ver, "1518b4f7ec6834a578c7a807736097ce", len);
       /* when built from repo */
-  if( strcmp(EFCH_INTF_VER, "770d9384f653b51b9d53b6d0cbfb7b2b") &&
+  if( strcmp(EFCH_INTF_VER, "0a44ec63174d01c5af7a7cf325a1605c") &&
       /* when built from distro */
       strcmp(EFCH_INTF_VER, "5c1c482de0fe41124c3dddbeb0bd5a1a") ) {
     fprintf(stderr, "ef_vi: ERROR: char interface has changed\n");

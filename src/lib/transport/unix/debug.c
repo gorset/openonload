@@ -249,11 +249,11 @@ static void ufd_fmt(int fd, char* buf, int* buf_n, int buf_len)
   fdi = fdip_to_fdi(fdip);
 
 #if CI_CFG_FD_CACHING
-  sprintf(s, "%s%s",
+  snprintf(s, sizeof(s), "%s%s",
 	  fdi->is_special ? "Special":"",
 	  fdi->can_cache ? "Cancache":"");
 #else
-  sprintf(s, "%s",
+  snprintf(s, sizeof(s), "%s",
 	  fdi->is_special ? "Special":"");
 #endif
 

@@ -1097,11 +1097,14 @@ static int citp_tcp_connect(citp_fdinfo* fdinfo,
   }
 
   if( moved ) {
-    fdinfo = citp_reprobe_moved(fdinfo, CI_FALSE, CI_FALSE);
+    citp_fdinfo* new_fdinfo;
+    int reprobe_rc = citp_reprobe_moved_common(fdinfo, CI_FALSE, CI_FALSE,
+                                               &new_fdinfo);
+    fdinfo = new_fdinfo;
     if( fdinfo == NULL ) {
       /* Most probably, it is EMFILE, but we can't know for sure.
        * And we can't handover since there is no fdinfo now. */
-      errno = EMFILE;
+      errno = (reprobe_rc == -ENOMEM) ? ENOMEM : EMFILE;
       return -1;
     }
 
@@ -1734,19 +1737,30 @@ static int citp_tcp_send(citp_fdinfo* fdinfo, const struct msghdr* msg,
     flags |= MSG_DONTWAIT;
   }
 
-  if(CI_LIKELY( msg->msg_iov != NULL && msg->msg_iovlen > 0 &&
-                (msg->msg_namelen == 0 || msg->msg_name != NULL) )) {
+  if(CI_LIKELY( msg->msg_iov != NULL && msg->msg_iovlen > 0 )) {
+    ci_uint32 state;
+
     Log_V(ci_log(LPF "send("EF_FMT", len=%d, "CI_SOCKCALL_FLAGS_FMT")",
                  EF_PRI_ARGS(epi,fdinfo->fd),
                  ci_iovec_bytes(msg->msg_iov, msg->msg_iovlen),
                  CI_SOCKCALL_FLAGS_PRI_ARG(flags)));
-    if( epi->sock.s->b.state != CI_TCP_LISTEN ) {
-      rc = ci_tcp_sendmsg(epi->sock.netif, SOCK_TO_TCP(epi->sock.s),
-                          msg->msg_iov, msg->msg_iovlen, flags); 
+
+    state = OO_ACCESS_ONCE(epi->sock.s->b.state);
+    /* Process CI_TCP_CLOSED without entering ci_tcp_sendmsg() because TCP state
+     * can be changed under our feet and we do not want to meet CI_TCP_LISTEN
+     * state inside ci_tcp_sendmsg(). */
+    if( CI_UNLIKELY(state == CI_TCP_CLOSED || state == CI_TCP_LISTEN ||
+                    state == CI_TCP_INVALID) ) {
+      if( CI_UNLIKELY(flags & ONLOAD_MSG_WARM) )
+        ++SOCK_TO_TCP(epi->sock.s)->stats.tx_msg_warm_abort;
+      if( (rc = ci_get_so_error(epi->sock.s)) != 0 )
+        CI_SET_ERROR(rc, rc);
+      else
+        CI_SET_ERROR(rc, EPIPE);
     }
     else {
-      errno = epi->sock.s->tx_errno;
-      rc = -1;
+      rc = ci_tcp_sendmsg(epi->sock.netif, SOCK_TO_TCP(epi->sock.s),
+                          msg->msg_iov, msg->msg_iovlen, flags); 
     }
   }
   else if( msg != NULL && msg->msg_iovlen == 0 ) {

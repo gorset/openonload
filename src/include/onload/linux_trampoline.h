@@ -25,14 +25,6 @@
 #error "This is a driver module."
 #endif
 
-/* On 4.17+ on x86_64 the system calls are taking a single
-   ptregs argument.
-   (The user-space calling convention is the same as before, though).
-*/
-#if defined(__x86_64__) && (LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0))
-#define ONLOAD_SYSCALL_PTREGS 1
-#endif
-
 
 /* Count users of our syscall interceprion.  Prevent crash when close()
  * with SO_LINGER runs if Onload module is unloaded simultaneously.
@@ -62,7 +54,7 @@ extern int efab_linux_trampoline_ctor(int no_sct);
 extern int efab_linux_trampoline_dtor(int no_sct);
 extern int efab_linux_trampoline_register(ci_private_t *priv, void *arg);
 
-#ifdef ONLOAD_SYSCALL_PTREGS
+#ifdef EFRM_SYSCALL_PTREGS
 extern asmlinkage int efab_linux_trampoline_close(struct pt_regs *regs);
 #ifdef CONFIG_COMPAT
 extern asmlinkage int efab_linux_trampoline_close32(struct pt_regs *regs);
@@ -79,7 +71,7 @@ extern asmlinkage int efab_linux_trampoline_ioctl (unsigned int fd,
 
 /* Close trampoline: gates between C and asm.
  * The gates have different parameters to make asm simpler. */
-#ifdef ONLOAD_SYSCALL_PTREGS
+#ifdef EFRM_SYSCALL_PTREGS
 extern asmlinkage long
 efab_linux_trampoline_handler_close64(struct pt_regs *regs);
 #ifdef CONFIG_COMPAT
@@ -105,14 +97,14 @@ extern void efab_linux_trampoline_ul_fail(void);
 #endif
 
 extern int safe_signals_and_exit;
-#ifdef ONLOAD_SYSCALL_PTREGS
+#ifdef EFRM_SYSCALL_PTREGS
 extern asmlinkage long efab_linux_trampoline_exit_group(const struct pt_regs *regs);
 #else
 extern asmlinkage long efab_linux_trampoline_exit_group(int status);
 #endif
 extern void efab_linux_termination_ctor(void);
 
-#ifdef ONLOAD_SYSCALL_PTREGS
+#ifdef EFRM_SYSCALL_PTREGS
 extern asmlinkage long
 efab_linux_trampoline_sigaction(const struct pt_regs *regs);
 #else
@@ -144,7 +136,7 @@ struct sigaction32 {
 };
 #endif
 
-#ifdef ONLOAD_SYSCALL_PTREGS
+#ifdef EFRM_SYSCALL_PTREGS
 extern asmlinkage int
 efab_linux_trampoline_sigaction32(const struct pt_regs *regs);
 #else

@@ -79,7 +79,7 @@
  *
  **************************************************************************/
 
-#define EFX_DRIVER_VERSION	"4.15.6.1004"
+#define EFX_DRIVER_VERSION	"4.15.12.1008"
 
 #ifdef DEBUG
 #define EFX_WARN_ON_ONCE_PARANOID(x) WARN_ON_ONCE(x)
@@ -143,7 +143,7 @@
 /* Size of an RX scatter buffer.  Small enough to pack 2 into a 4K page,
  * and should be a multiple of the cache line size.
  */
-#define EFX_RX_USR_BUF_SIZE	(2048 - 256)
+#define EFX_RX_USR_BUF_SIZE	(2048 - 256 - XDP_PACKET_HEADROOM)
 #else
 /* Size of an RX scatter buffer. */
 #define EFX_RX_USR_BUF_SIZE	(PAGE_SIZE - L1_CACHE_BYTES)
@@ -1439,7 +1439,7 @@ struct efx_mtd {
  * @vf_init_count: Number of VFs that have been fully initialised.
  * @vi_scale: log2 number of vnics per VF.
  * @ptp_data: PTP state data
- * @phc_efx: The adapter exposing the PHC clock.
+ * @phc_ptp_data: PTP state data of the adapter exposing the PHC clock.
  * @node_ptp_all_funcs: List node for maintaining list of all functions.
  *	Serialised by ptp_all_funcs_list_lock
  * @monitor_work: Hardware monitor workitem
@@ -1698,7 +1698,7 @@ struct efx_nic {
 
 #ifdef CONFIG_SFC_PTP
 	struct efx_ptp_data *ptp_data;
-	struct efx_nic *phc_efx;
+	struct efx_ptp_data *phc_ptp_data;
 	struct list_head node_ptp_all_funcs;
 	bool ptp_unavailable_warned;
 #endif
@@ -1760,12 +1760,17 @@ struct efx_mtd_partition {
 #endif
 
 struct efx_udp_tunnel {
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
+#define TUNNEL_ENCAP_UDP_PORT_ENTRY_INVALID	0xffff
+#endif
 	u16 type; /* TUNNEL_ENCAP_UDP_PORT_ENTRY_foo, see mcdi_pcol.h */
 	__be16 port;
+#if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
 	/* Current state of slot.  Used only inside the list, not in request
 	 * arguments.
 	 */
 	u16 adding:1, removing:1, count:14;
+#endif
 };
 #define	EFX_UDP_TUNNEL_COUNT_WARN	0x2000 /* top bit of 14-bit field */
 #define EFX_UDP_TUNNEL_COUNT_MAX	0x3fff /* saturate at this value */
@@ -1922,9 +1927,9 @@ struct efx_udp_tunnel {
  * @vswitching_remove: Free the vports and vswitches.
  * @get_mac_address: Get mac address from underlying vport/pport.
  * @set_mac_address: Set the MAC address of the device
+ * @udp_tnl_has_port: Check if a port has been added as UDP tunnel
  * @udp_tnl_push_ports: Push the list of UDP tunnel ports to the NIC if required.
  * @udp_tnl_add_port: Add a UDP tunnel port
- * @udp_tnl_has_port: Check if a port has been added as UDP tunnel
  * @udp_tnl_del_port: Remove a UDP tunnel port
  * @revision: Hardware architecture revision
  * @txd_ptr_tbl_base: TX descriptor ring base address
@@ -2144,10 +2149,14 @@ struct efx_nic_type {
 	int (*get_mac_address)(struct efx_nic *efx, unsigned char *perm_addr);
 	int (*set_mac_address)(struct efx_nic *efx);
 	unsigned int (*mcdi_rpc_timeout)(struct efx_nic *efx, unsigned int cmd);
+	bool (*udp_tnl_has_port)(struct efx_nic *efx, __be16 port);
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
+	int (*udp_tnl_push_ports)(struct efx_nic *efx);
+#else
 	void (*udp_tnl_push_ports)(struct efx_nic *efx);
 	void (*udp_tnl_add_port)(struct efx_nic *efx, struct efx_udp_tunnel tnl);
-	bool (*udp_tnl_has_port)(struct efx_nic *efx, __be16 port);
 	void (*udp_tnl_del_port)(struct efx_nic *efx, struct efx_udp_tunnel tnl);
+#endif
 
 	int revision;
 	unsigned int txd_ptr_tbl_base;

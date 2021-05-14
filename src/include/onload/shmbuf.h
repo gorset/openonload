@@ -31,9 +31,14 @@
  *--------------------------------------------------------------------*/
 
 typedef struct {
-  void*         base;
   size_t        n_pages;
   struct page** pages;
+#ifndef EFRM_HAVE_ALLOC_VM_AREA_WITH_PTES
+  void*         base;
+#else
+  struct vm_struct *vm;
+  pte_t**       ptes;
+#endif
 } ci_shmbuf_t;
 
 
@@ -45,7 +50,11 @@ ci_inline unsigned ci_shmbuf_size(ci_shmbuf_t* b)
 { return b->n_pages << CI_PAGE_SHIFT; }
 
 ci_inline void* __ci_shmbuf_ptr(ci_shmbuf_t* b, unsigned off) {
+#ifndef EFRM_HAVE_ALLOC_VM_AREA_WITH_PTES
   return (char*)b->base + off;
+#else
+  return (char*)b->vm->addr + off;
+#endif
 }
 
 /* Asserts that accessing the shmbuf at the given offset (using
@@ -76,8 +85,11 @@ ci_inline char* ci_shmbuf_ptr(ci_shmbuf_t* b, unsigned off) {
   return __ci_shmbuf_ptr(b, off);
 }
 
-extern int ci_shmbuf_demand_page(ci_shmbuf_t* b, unsigned page_i,
-				 ci_irqlock_t* lock);
+extern int ci_shmbuf_demand_page(ci_shmbuf_t* b, unsigned page_i
+#ifndef EFRM_HAVE_ALLOC_VM_AREA_WITH_PTES
+                          , ci_irqlock_t* lock
+#endif
+                          );
 
 ci_inline unsigned ci_shmbuf_nopage(ci_shmbuf_t* b, unsigned offset)
 {

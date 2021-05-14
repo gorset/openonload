@@ -1,5 +1,60 @@
-Onload-7.1.0
+Onload-7.1.1
 ============
+
+ This is an update release of Onload that extends support to recent operating
+ system updates, includes a new sfc net driver and fixes various bugs.
+
+ See the accompanying ChangeLog for a list of bugs fixed.
+
+Linux distribution support
+--------------------------
+
+ This package is supported on:
+ - Red Hat Enterprise Linux 6.9 - 6.10
+ - Red Hat Enterprise Linux 7.6 - 7.9
+ - Red Hat Enterprise Linux 8.1 - 8.3
+ - SuSE Linux Enterprise Server 12 sp4 and sp5
+ - SuSE Linux Enterprise Server 15 sp1 and sp2
+ - Canonical Ubuntu Server LTS 18.04 and 20.04
+ - Debian 9 "Stretch"
+ - Debian 10 "Buster"
+ - Linux kernels 4.4 - 5.9
+
+
+setuid/setgid
+-------------
+
+The onload binaries were previously installed as setuid/setgid by default.
+This is no longer the case. The previous behaviour can be selected by
+passing the --setuid flag to onload_install.
+
+
+EF_TCP_COMBINE_SENDS_MODE
+-------------------------
+
+A new option controls how Onload fills packets in the TCP send buffer. In the
+default mode (set to 0) Onload will prefer to use all the space at the end of
+a previous packet before allocating a new one. When set to 1, Onload will
+prefer to allocate a new packet for each new send.
+
+In all cases this is a hint rather than guaranteed behaviour: there are
+conditions where the preference indicated by this option will not be possible,
+e.g. memory pressure may cause packets in the send queue to be combined.
+MSG_MORE and TCP_CORK can override this option when set. The zero-copy sends
+API may also use the segmentation provided by the caller's buffers.
+
+For full control of message segmentation the delegated sends API can be used.
+Setting this option can affect the capacity of send buffers belonging to
+sockets in this stack and increase packet buffer usage. It can also reduce
+efficiency as packets will be allocated for each send call rather than being
+able to reuse one that is already available.
+
+N.B. Setting this option is only recommended for those who have an explicit
+need to avoid combined or split sends.
+
+
+Onload-7.1.0.265
+================
 
  This is a feature release of Onload that adds system-level interface
  blacklisting, provides improvements for XDP and TCPDirect, includes various

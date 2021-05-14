@@ -151,6 +151,8 @@ typedef ci_uint32 cp_hwport_flags_t;
 typedef cp_hwport_flags_t cp_llap_flags_t;
 typedef ci_uint64 cp_nic_flags_t;
 
+typedef ci_uint32 cp_xdp_prog_id_t;
+
 typedef struct cicp_llap_row_s {
   ci_ifid_t ifindex;
 
@@ -188,6 +190,9 @@ typedef struct cicp_llap_row_s {
   cicp_hwport_mask_t tx_hwports;
   cicp_hwport_mask_t rx_hwports;
 
+  /* program_id is stored in llap before it gets propagated to hwport */
+  cp_xdp_prog_id_t xdp_prog_id;
+
   /* If we make a routing request specifying this interface in RTA_IIF, use the
    * fwd table specified in this field to store the result. */
   cp_fwd_table_id iif_fwd_table_id;
@@ -198,6 +203,8 @@ struct cp_hwport_row {
 /* we reuse CP_LLAP flags here */
   cp_hwport_flags_t flags;
   cp_nic_flags_t nic_flags CI_ALIGN(8);
+
+  cp_xdp_prog_id_t xdp_prog_id;
 };
 
 
@@ -453,6 +460,17 @@ struct cp_fwd_row {
   struct cp_fwd_key_ext key_ext;
   struct cp_fwd_data    data[2]; /* two snapshots of data */
 
+  uint32_t use; /* in how many probe sequences record is used */
+
+
+  /* Following data is accessed from fast path:
+   * - check version;
+   * - check CICP_FWD_FLAG_STALE;
+   * - check frc_stale value in the STALE case.
+   * It is aligned to 16, which is the size of these fields.  It guarantees
+   * that all this fast-path data belong to one cache line.
+   */
+
   /* Version is the "data" version. Even version means that snapshot of data
    * at index 0 is to be read by clients, odd that the data under index 1.
    *
@@ -460,9 +478,8 @@ struct cp_fwd_row {
    * The version may be updated without any data change, for example for
    * CICP_FWD_FLAG_STALE flag.
    */
-  cp_version_t version;
-  uint32_t use; /* in how many probe sequences record is used */
-  uint8_t flags;
+  cp_version_t version CI_ALIGN(16);
+  uint32_t flags;
 
 /* flags used by server */
 /* fwd row is at least half ttl old and frc_used needs refreshing */
@@ -485,6 +502,7 @@ struct cp_fwd_row {
 #define CICP_FWD_FLAG_OCCUPIED        0x80
 /* data field has been filled once */
 #define CICP_FWD_FLAG_DATA_VALID      0x40
+  ci_uint64 frc_stale;
 };
 
 static inline int/*bool*/
@@ -803,23 +821,42 @@ cp_get_fwd_data_current(struct cp_fwd_row* r)
   return &r->data[*cp_fwd_version(r) & 1];
 }
 
-static inline int
-cp_fwd_version_matches(struct cp_fwd_table* fwd_table, cicp_verinfo_t* ver)
-{
-  ci_assert_nequal(ver->id, CICP_ROWID_BAD);
-  ci_assert(CICP_ROWID_IS_VALID(ver->id));
-  return ver->version == *cp_fwd_version(cp_get_fwd(fwd_table, ver));
-}
-
-
 static inline struct cp_fwd_rw_row*
 cp_get_fwd_rw(struct cp_fwd_table* fwd_table, cicp_verinfo_t* ver)
 {
+  ci_assert_nequal(ver->id, CICP_ROWID_BAD);
+  ci_assert(CICP_ROWID_IS_VALID(ver->id));
+  return &fwd_table->rw_rows[ver->id];
+}
+
+static inline int
+cp_fwd_version_matches(struct cp_fwd_table* fwd_table, cicp_verinfo_t* ver)
+{
+  struct cp_fwd_row* fwd;
   ci_assert_nequal(fwd_table, NULL);
   ci_assert_nequal(ver->id, CICP_ROWID_BAD);
   ci_assert(CICP_ROWID_IS_VALID(ver->id));
-  ci_assert_le(ver->id, fwd_table->mask);
-  return &fwd_table->rw_rows[ver->id];
+  fwd = cp_get_fwd(fwd_table, ver);
+
+  if( ver->version == *cp_fwd_version(fwd) ) {
+    if( fwd->flags & CICP_FWD_FLAG_STALE ) {
+      struct cp_fwd_rw_row* fwd_rw = cp_get_fwd_rw(fwd_table, ver);
+
+      /* See cp_server:fwd_row_refresh() for the writing counterpart of
+       * this "stale" machinery.
+       *
+       * We do not use rmb() here because mistakes are allowed.
+       */
+
+      /* If frc_used < frc_stale then update frc_used: */
+      if( (ci_int64)(fwd_rw->frc_used - fwd->frc_stale) < 0 )
+        ci_frc64(&fwd_rw->frc_used);
+    }
+    return 1;
+  }
+  else {
+    return 0;
+  }
 }
 
 static inline int /*bool*/

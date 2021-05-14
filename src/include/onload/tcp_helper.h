@@ -179,9 +179,6 @@ typedef struct tcp_helper_resource_s {
 /* 0x40 is available for reuse; was OO_TRUSTED_LOCK_DONT_BLOCK_SHARED. */
 #define OO_TRUSTED_LOCK_SWF_UPDATE        0x80
 #define OO_TRUSTED_LOCK_PURGE_TXQS        0x100
-#if CI_CFG_WANT_BPF_NATIVE && CI_HAVE_BPF_NATIVE
-#define OO_TRUSTED_LOCK_XDP_CHANGE        0x200
-#endif
   volatile unsigned      trusted_lock;
 
   /*! Link for global list of stacks. */
@@ -238,17 +235,28 @@ typedef struct tcp_helper_resource_s {
   struct delayed_work purge_txq_work;
 
 #ifdef CONFIG_NAMESPACES
-#ifdef ERFM_HAVE_NEW_KALLSYMS
+
+/* Use nsproxy for RHEL6, because free_pid_ns() is not exported here */
+#if defined(RHEL_MAJOR)
+#if RHEL_MAJOR == 6
+#define OO_USE_NSPROXY
+#endif
+#endif
 
 #define EFRM_DO_NAMESPACES
-  /* Namespaces this stack is living into */
+#ifdef OO_USE_NSPROXY
   struct nsproxy *nsproxy;
-#else /* ERFM_HAVE_NEW_KALLSYMS */
-
-/* If CONFIG_IPC_NS is enabled, we really need to handle namespaces.
- * But we can't without ERFM_HAVE_NEW_KALLSYMS. */
-
+#else
+  /* Namespaces this stack is living into */
+  struct net* net_ns;
+  struct pid_namespace* pid_ns;
+#ifdef ERFM_HAVE_NEW_KALLSYMS
+#define OO_HAS_IPC_NS
+  /* put_ipc_ns() is not exported, so we can't use it without
+   * kallsyms_on_each_symbol() */
+  struct ipc_namespace* ipc_ns;
 #endif /* ERFM_HAVE_NEW_KALLSYMS */
+#endif /* OO_USE_NSPROXY */
 #endif /* CONFIG_NAMESPACES */
 
 #ifdef EFRM_DO_USER_NS
@@ -305,8 +313,6 @@ typedef struct tcp_helper_resource_s {
   unsigned              intfs_to_reset;
   /* Bit mask of intf_i that have been removed/suspended and not yet reset */
   unsigned              intfs_suspended;
-  /* Bit mask of intf_i that need xdp updating by the lock holder */
-  unsigned              intfs_to_xdp_update;
 
   unsigned              mem_mmap_bytes;
   unsigned              io_mmap_bytes;
@@ -471,6 +477,14 @@ struct tcp_helper_endpoint_s {
 
 #ifdef EFRM_DO_NAMESPACES
 
+#ifdef OO_USE_NSPROXY
+#define thr_net_ns(thr) ((thr)->nsproxy->net_ns)
+#define thr_pid_ns(thr) ((thr)->nsproxy->pid_ns)
+#else
+#define thr_net_ns(thr) ((thr)->net_ns)
+#define thr_pid_ns(thr) ((thr)->pid_ns)
+#endif
+
 static inline struct pid_namespace*
 ci_get_pid_ns(struct nsproxy* proxy)
 {
@@ -489,8 +503,11 @@ ci_get_pid_ns(struct nsproxy* proxy)
 ci_inline struct pid_namespace* ci_netif_get_pidns(ci_netif* ni)
 {
   tcp_helper_resource_t* thr = netif2tcp_helper_resource(ni);
-  struct pid_namespace* ns = ci_get_pid_ns(thr->nsproxy);
-  return ns;
+#ifdef OO_USE_NSPROXY
+  return ci_get_pid_ns(thr->nsproxy);
+#else
+  return thr->pid_ns;
+#endif
 }
 
 /* Log an error and return failure if the current process is not in
@@ -510,8 +527,8 @@ ci_inline int ci_netif_check_namespace(ci_netif* ni)
     ci_log("In ci_netif_check_namespace() without valid namespaces");
     return -EINVAL;
   }
-  if( (thr->nsproxy->net_ns != current->nsproxy->net_ns) ||
-      (ci_get_pid_ns(thr->nsproxy) != ci_get_pid_ns(current->nsproxy)) )
+  if( (thr_net_ns(thr) != current->nsproxy->net_ns) ||
+      (thr_pid_ns(thr) != ci_get_pid_ns(current->nsproxy)) )
   {
     ci_log("NAMESPACE MISMATCH: pid %d accessed a foreign stack",
            current->pid);

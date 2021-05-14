@@ -72,8 +72,8 @@ struct proc_dir_entry *oo_proc_root = NULL;
  *
  *--------------------------------------------------------------------*/
 
-static const struct file_operations efab_version_fops;
-static const struct file_operations efab_dlfilters_fops;
+static const struct proc_ops efab_version_fops;
+static const struct proc_ops efab_dlfilters_fops;
 
 /*--------------------------------------------------------------------
  *
@@ -83,8 +83,8 @@ static const struct file_operations efab_dlfilters_fops;
 
 /* Entries under /proc/drivers/sfc */
 typedef struct ci_proc_efab_entry_s {
-  char                          *name;  /**< Entry name */
-  const struct file_operations  *fops;  /**< Proc file operations */
+  char                   *name;  /**< Entry name */
+  const struct proc_ops  *fops;  /**< Proc file operations */
 } ci_proc_efab_entry_t;
 static ci_proc_efab_entry_t ci_proc_efab_table[] = {
     {"version",       &efab_version_fops},
@@ -176,12 +176,12 @@ efab_stacks_seq_open(struct inode *inode, struct file *file)
   return seq_open(file, &efab_stacks_seq_ops);
 
 }
-static struct file_operations efab_stacks_seq_fops = {
-  .owner    = THIS_MODULE,
-  .open     = efab_stacks_seq_open,
-  .read     = seq_read,
-  .llseek   = seq_lseek,
-  .release  = seq_release_private,
+static struct proc_ops efab_stacks_seq_fops = {
+  PROC_OPS_SET_OWNER
+  .proc_open     = efab_stacks_seq_open,
+  .proc_read     = seq_read,
+  .proc_lseek    = seq_lseek,
+  .proc_release  = seq_release_private,
 };
 
 
@@ -228,12 +228,12 @@ efab_stacks_ul_seq_open(struct inode *inode, struct file *file)
   return seq_open(file, &efab_stacks_ul_seq_ops);
 
 }
-static struct file_operations efab_stacks_ul_seq_fops = {
-  .owner    = THIS_MODULE,
-  .open     = efab_stacks_ul_seq_open,
-  .read     = seq_read,
-  .llseek   = seq_lseek,
-  .release  = seq_release_private,
+static struct proc_ops efab_stacks_ul_seq_fops = {
+  PROC_OPS_SET_OWNER
+  .proc_open     = efab_stacks_ul_seq_open,
+  .proc_read     = seq_read,
+  .proc_lseek    = seq_lseek,
+  .proc_release  = seq_release_private,
 };
 
 
@@ -278,12 +278,12 @@ efab_stacks_k_seq_open(struct inode *inode, struct file *file)
   return seq_open(file, &efab_stacks_k_seq_ops);
 
 }
-static struct file_operations efab_stacks_k_seq_fops = {
-  .owner    = THIS_MODULE,
-  .open     = efab_stacks_k_seq_open,
-  .read     = seq_read,
-  .llseek   = seq_lseek,
-  .release  = seq_release_private,
+static struct proc_ops efab_stacks_k_seq_fops = {
+   PROC_OPS_SET_OWNER
+  .proc_open     = efab_stacks_k_seq_open,
+  .proc_read     = seq_read,
+  .proc_lseek    = seq_lseek,
+  .proc_release  = seq_release_private,
 };
 
 
@@ -308,12 +308,12 @@ static int efab_version_open_proc(struct inode *inode, struct file *file)
 {
     return single_open(file, efab_version_read_proc, 0);
 }
-static const struct file_operations efab_version_fops = {
-    .owner   = THIS_MODULE,
-    .open    = efab_version_open_proc,
-    .read    = seq_read,
-    .llseek  = seq_lseek,
-    .release = single_release,
+static const struct proc_ops efab_version_fops = {
+   PROC_OPS_SET_OWNER
+    .proc_open    = efab_version_open_proc,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
 };
 
 
@@ -338,12 +338,12 @@ static int efab_dlfilters_open_proc(struct inode *inode, struct file *file)
 {
     return single_open(file, efab_dlfilters_read_proc, 0);
 }
-static const struct file_operations efab_dlfilters_fops = {
-    .owner   = THIS_MODULE,
-    .open    = efab_dlfilters_open_proc,
-    .read    = seq_read,
-    .llseek  = seq_lseek,
-    .release = single_release,
+static const struct proc_ops efab_dlfilters_fops = {
+     PROC_OPS_SET_OWNER
+    .proc_open    = efab_dlfilters_open_proc,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
 };
 
 
@@ -406,12 +406,12 @@ static int oo_filter_hwports_open(struct inode *inode, struct file *file)
 {
     return single_open(file, oo_filter_hwports_read, PDE_DATA(inode));
 }
-static const struct file_operations oo_filter_hwports_fops = {
-    .owner   = THIS_MODULE,
-    .open    = oo_filter_hwports_open,
-    .read    = seq_read,
-    .llseek  = seq_lseek,
-    .release = single_release,
+static const struct proc_ops oo_filter_hwports_fops = {
+    PROC_OPS_SET_OWNER
+    .proc_open    = oo_filter_hwports_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
 };
 
 static int oo_filter_ipaddrs_read(struct seq_file *seq, void *unused)
@@ -422,28 +422,28 @@ static int oo_filter_ipaddrs_open(struct inode *inode, struct file *file)
 {
     return single_open(file, oo_filter_ipaddrs_read, PDE_DATA(inode));
 }
-static const struct file_operations oo_filter_ipaddrs_fops = {
-    .owner   = THIS_MODULE,
-    .open    = oo_filter_ipaddrs_open,
-    .read    = seq_read,
-    .llseek  = seq_lseek,
-    .release = single_release,
+static const struct proc_ops oo_filter_ipaddrs_fops = {
+    PROC_OPS_SET_OWNER
+    .proc_open    = oo_filter_ipaddrs_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
 };
 
-static const struct file_operations oo_cp_stats_fops = {
-    .owner   = THIS_MODULE,
-    .open    = cp_proc_stats_open,
-    .read    = seq_read,
-    .llseek  = seq_lseek,
-    .release = seq_release,
+static const struct proc_ops oo_cp_stats_fops = {
+    PROC_OPS_SET_OWNER
+    .proc_open    = cp_proc_stats_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = seq_release,
 };
 
-static const struct file_operations oo_cp_server_pids_fops = {
-    .owner   = THIS_MODULE,
-    .open    = cp_server_pids_open,
-    .read    = seq_read,
-    .llseek  = seq_lseek,
-    .release = seq_release,
+static const struct proc_ops oo_cp_server_pids_fops = {
+    PROC_OPS_SET_OWNER
+    .proc_open    = cp_server_pids_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = seq_release,
 };
 
 

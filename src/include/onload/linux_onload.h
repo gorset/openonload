@@ -228,4 +228,14 @@ static inline int/*bool*/ oo_avoid_wakeup_from_dl(void)
     oo_avoid_wakeup_under_pressure >= jiffies;
 }
 
+
+#ifndef EFRM_HAVE_GET_RANDOM_LONG
+/* 2.6.32 <= linux <= 4.4 can be of 2 kinds: */
+#ifdef EFRM_HAVE_PRANDOM_U32
+#define get_random_long prandom_u32
+#else
+#define get_random_long net_random
+#endif
+#endif
+
 #endif  /* __CI_DRIVER_EFAB_LINUX_ONLOAD__ */

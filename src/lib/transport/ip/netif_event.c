@@ -226,7 +226,7 @@ static void measure_processing_delay(ci_netif* ni, struct timespec pkt_ts,
 #else
 
 static inline void measure_processing_delay(ci_netif* ni,
-                                            struct timespec pkt_ts,
+                                            ef_timespec pkt_ts,
                                             unsigned sync_flags)
 {
 }
@@ -294,7 +294,7 @@ static void get_rx_timestamp(ci_netif* netif, ci_ip_pkt_fmt* pkt)
 
   if( nsn->oo_vi_flags & OO_VI_FLAGS_RX_HW_TS_EN ) {
     unsigned sync_flags;
-    struct timespec stamp;
+    ef_timespec stamp;
     int rc = ef_vi_receive_get_timestamp_with_sync_flags
       (&netif->nic_hw[pkt->intf_i].vi,
        PKT_START(pkt) - nsn->rx_prefix_len, &stamp, &sync_flags);
@@ -313,7 +313,7 @@ static void get_rx_timestamp(ci_netif* netif, ci_ip_pkt_fmt* pkt)
       measure_processing_delay(netif, stamp, sync_flags);
 
       LOG_NR(log(LPF "RX id=%d timestamp: %lu.%09lu sync %d",
-          OO_PKT_FMT(pkt), stamp.tv_sec, stamp.tv_nsec, sync_flags));
+          OO_PKT_FMT(pkt), (long)stamp.tv_sec, stamp.tv_nsec, sync_flags));
     } else {
       LOG_NR(log(LPF "RX id=%d missing timestamp", OO_PKT_FMT(pkt)));
       pkt->hw_stamp.tv_sec = 0;
@@ -500,6 +500,121 @@ static void handle_rx_pkt(ci_netif* netif, struct ci_netif_poll_state* ps,
   return;
 #endif
 }
+
+
+#ifdef __KERNEL__
+
+int ci_netif_evq_poll(ci_netif* ni, int intf_i)
+{
+  ef_vi* evq = &ni->nic_hw[intf_i].vi;
+  int n_evs;
+#if CI_CFG_WANT_BPF_NATIVE && CI_HAVE_BPF_NATIVE
+  ef_event *ev = ni->state->events;
+#endif
+
+  ci_assert_lt(intf_i, CI_CFG_MAX_INTERFACES);
+  if( intf_i >= oo_stack_intf_max(ni) )
+     return 0; /* for simplicity no error reported */
+  n_evs = ef_eventq_poll(evq, ni->state->events,
+                         sizeof(ni->state->events) / sizeof(ni->state->events[0]));
+
+#if CI_CFG_WANT_BPF_NATIVE && CI_HAVE_BPF_NATIVE
+  if( NI_OPTS(ni).xdp_mode == 0 )
+    return n_evs;
+
+  {
+    struct ef_vi_rvq_rx_iter ri;
+    uint32_t id;
+    size_t len = 0; /* placate compiler */
+
+    ef_vi_evq_rx_iter_set(&ri, evq, ev, n_evs);
+
+    while( (id = ef_vi_evq_rx_iter_next(&ri, &id, &len)) != 0 ) {
+      oo_pkt_p pp;
+      ci_ip_pkt_fmt* pkt;
+
+      OO_PP_INIT(ni, pp, id);
+      pkt = PKT_CHK(ni, pp);
+
+      ci_prefetch_ppc(pkt->dma_start);
+      ci_prefetch_ppc(pkt);
+      ci_assert_equal(pkt->intf_i, intf_i);
+
+      /* Whole packet in a single buffer. */
+      if( len == 0 )
+        ef_vi_receive_get_bytes(evq, pkt->dma_start,
+                                (uint16_t*)&pkt->pay_len);
+      else
+        pkt->pay_len = len - evq->rx_prefix_len;
+      oo_offbuf_init(&pkt->buf, PKT_START(pkt), pkt->pay_len);
+      ci_parse_rx_vlan(pkt);
+      if( !efab_tcp_helper_xdp_rx_pkt(netif2tcp_helper_resource(ni), intf_i, pkt) )
+        pkt->flags |= CI_PKT_FLAG_XDP_DROP; /* schedule drop */
+      /* We called ci_parse_rx_vlan() above, which initialised
+       * pkt_eth_payload_off.  However, the main RX loop will call that
+       * function again, and it asserts at entry that the field is
+       * uninitialised, so we reset it here. */
+      CI_DEBUG(pkt->pkt_eth_payload_off = 0xff);
+    }
+  }
+
+#endif
+   return n_evs;
+}
+#endif
+
+
+#if defined(__KERNEL__) && CI_CFG_WANT_BPF_NATIVE
+#if CI_HAVE_BPF_NATIVE
+ci_inline int oo_xdp_check_pkt(ci_netif* ni, int intf_i, ci_ip_pkt_fmt** pkt)
+{
+  if( NI_OPTS(ni).xdp_mode != 0 &&
+      ! efab_tcp_helper_xdp_rx_pkt(netif2tcp_helper_resource(ni), intf_i, *pkt) ) {
+    /* just drop */
+    (*pkt)->flags &= ~CI_PKT_FLAG_XDP_DROP;
+    ci_netif_pkt_release_rx_1ref(ni, *pkt);
+    *pkt = NULL;
+    return 0;
+  }
+  return 1;
+}
+#define oo_xdp_check_pkt oo_xdp_check_pkt
+#endif
+#endif
+
+
+#ifndef oo_xdp_check_pkt
+#if ! defined(__KERNEL__) && CI_CFG_WANT_BPF_NATIVE
+ci_inline int oo_xdp_check_pkt(ci_netif* ni, int intf_i, ci_ip_pkt_fmt** pkt)
+{
+  if( NI_OPTS(ni).xdp_mode != 0 &&
+      ((*pkt)->flags & CI_PKT_FLAG_XDP_DROP) ) {
+    /* just drop */
+    (*pkt)->flags &= ~CI_PKT_FLAG_XDP_DROP;
+    ci_netif_pkt_release_rx_1ref(ni, *pkt);
+    *pkt = NULL;
+    return 0;
+  }
+  return 1;
+}
+#else
+ci_inline int oo_xdp_check_pkt(ci_netif* ni, int intf_i, ci_ip_pkt_fmt** pkt)
+{
+  return 1;
+}
+#endif
+#endif
+
+
+ci_inline void __handle_rx_pkt(ci_netif* ni, struct ci_netif_poll_state* ps,
+                              int intf_i, ci_ip_pkt_fmt** pkt)
+{
+  if( *pkt != NULL && oo_xdp_check_pkt(ni, intf_i, pkt) ) {
+    ci_parse_rx_vlan(*pkt);
+    handle_rx_pkt(ni, ps, *pkt);
+  }
+}
+
 
 #ifndef __KERNEL__
 /* Partially handle an incoming packet before its completion event.
@@ -812,7 +927,7 @@ static void handle_rx_scatter_merge(ci_netif* ni, struct oo_rx_state* s,
 
 
 static int handle_rx_csum_bad(ci_netif* ni, struct ci_netif_poll_state* ps,
-                              ci_ip_pkt_fmt* pkt, int frame_len)
+                              int intf_i, ci_ip_pkt_fmt* pkt, int frame_len)
 {
   int ip_paylen;
   int ip_proto;
@@ -885,7 +1000,7 @@ static int handle_rx_csum_bad(ci_netif* ni, struct ci_netif_poll_state* ps,
       goto drop;
     }
     else if( ci_tcp_csum_correct(pkt, ip_paylen) ) {
-      handle_rx_pkt(ni, ps, pkt);
+      __handle_rx_pkt(ni, ps, intf_i, &pkt);
       return 1;
     }
     else {
@@ -904,7 +1019,7 @@ static int handle_rx_csum_bad(ci_netif* ni, struct ci_netif_poll_state* ps,
       goto drop;
     }
     else if( ci_udp_csum_correct(pkt, udp) ) {
-      handle_rx_pkt(ni, ps, pkt);
+      __handle_rx_pkt(ni, ps, intf_i, &pkt);
       return 1;
     }
     else {
@@ -932,11 +1047,8 @@ static void handle_rx_no_desc_trunc(ci_netif* ni,
   LOG_U(log(LPF "[%d] intf %d RX_NO_DESC_TRUNC "EF_EVENT_FMT,
             NI_ID(ni), intf_i, EF_EVENT_PRI_ARG(ev)));
 
-  if( s->rx_pkt != NULL ) {
-    ci_parse_rx_vlan(s->rx_pkt);
-    handle_rx_pkt(ni, ps, s->rx_pkt);
-    s->rx_pkt = NULL;
-  }
+  __handle_rx_pkt(ni, ps, intf_i, &s->rx_pkt);
+  s->rx_pkt = NULL;
   ci_assert(s->frag_pkt != NULL);
   if( s->frag_pkt != NULL ) {  /* belt and braces! */
     ci_netif_pkt_release_rx_1ref(ni, s->frag_pkt);
@@ -957,11 +1069,8 @@ static void __handle_rx_discard(ci_netif* ni, struct ci_netif_poll_state* ps,
             NI_ID(ni), intf_i,
             (int) discard_type, EF_EVENT_PRI_ARG(ev)));
 
-  if( s->rx_pkt != NULL ) {
-    ci_parse_rx_vlan(s->rx_pkt);
-    handle_rx_pkt(ni, ps, s->rx_pkt);
-    s->rx_pkt = NULL;
-  }
+  __handle_rx_pkt(ni, ps, intf_i, &s->rx_pkt);
+  s->rx_pkt = NULL;
 
   /* For now bin any fragments as (i) they would only be useful in the
    * CSUM_BAD case; (ii) the hardware is probably right about the
@@ -980,7 +1089,7 @@ static void __handle_rx_discard(ci_netif* ni, struct ci_netif_poll_state* ps,
   pkt = PKT_CHK(ni, pp);
 
   if( discard_type == EF_EVENT_RX_DISCARD_CSUM_BAD && !is_frag )
-    handled = handle_rx_csum_bad(ni, ps, pkt, frame_len);
+    handled = handle_rx_csum_bad(ni, ps, intf_i, pkt, frame_len);
   
   switch( discard_type ) {
   case EF_EVENT_RX_DISCARD_CSUM_BAD:
@@ -1310,118 +1419,6 @@ void ci_netif_tx_pkt_complete(ci_netif* ni, struct ci_netif_poll_state* ps,
 }
 
 
-#ifdef __KERNEL__
-
-int ci_netif_evq_poll(ci_netif* ni, int intf_i)
-{
-  ef_vi* evq = &ni->nic_hw[intf_i].vi;
-  int n_evs;
-#if CI_CFG_WANT_BPF_NATIVE && CI_HAVE_BPF_NATIVE
-  ef_event *ev = ni->state->events;
-#endif
-
-  ci_assert_lt(intf_i, CI_CFG_MAX_INTERFACES);
-  if( intf_i >= oo_stack_intf_max(ni) )
-     return 0; /* for simplicity no error reported */
-  n_evs = ef_eventq_poll(evq, ni->state->events,
-                         sizeof(ni->state->events) / sizeof(ni->state->events[0]));
-
-#if CI_CFG_WANT_BPF_NATIVE && CI_HAVE_BPF_NATIVE
-  if( NI_OPTS(ni).xdp_mode == 0 )
-    return n_evs;
-
-  {
-    struct ef_vi_rvq_rx_iter ri;
-    uint32_t id;
-    size_t len = 0; /* placate compiler */
-
-    ef_vi_evq_rx_iter_set(&ri, evq, ev, n_evs);
-
-    while( (id = ef_vi_evq_rx_iter_next(&ri, &id, &len)) != 0 ) {
-      oo_pkt_p pp;
-      ci_ip_pkt_fmt* pkt;
-
-      OO_PP_INIT(ni, pp, id);
-      pkt = PKT_CHK(ni, pp);
-
-      ci_prefetch_ppc(pkt->dma_start);
-      ci_prefetch_ppc(pkt);
-      ci_assert_equal(pkt->intf_i, intf_i);
-
-      /* Whole packet in a single buffer. */
-      if( len == 0 )
-        ef_vi_receive_get_bytes(evq, pkt->dma_start,
-                                (uint16_t*)&pkt->pay_len);
-      else
-        pkt->pay_len = len - evq->rx_prefix_len;
-      oo_offbuf_init(&pkt->buf, PKT_START(pkt), pkt->pay_len);
-      ci_parse_rx_vlan(pkt);
-      if( !efab_tcp_helper_xdp_rx_pkt(netif2tcp_helper_resource(ni), intf_i, pkt) )
-        pkt->flags |= CI_PKT_FLAG_XDP_DROP; /* schedule drop */
-      /* We called ci_parse_rx_vlan() above, which initialised
-       * pkt_eth_payload_off.  However, the main RX loop will call that
-       * function again, and it asserts at entry that the field is
-       * uninitialised, so we reset it here. */
-      CI_DEBUG(pkt->pkt_eth_payload_off = 0xff);
-    }
-  }
-
-#endif
-   return n_evs;
-}
-#endif
-
-#if defined(__KERNEL__) && CI_CFG_WANT_BPF_NATIVE
-#if CI_HAVE_BPF_NATIVE
-ci_inline int oo_xdp_check_pkt(ci_netif* ni, int intf_i, ci_ip_pkt_fmt** pkt)
-{
-  if( NI_OPTS(ni).xdp_mode != 0 &&
-      ! efab_tcp_helper_xdp_rx_pkt(netif2tcp_helper_resource(ni), intf_i, *pkt) ) {
-    /* just drop */
-    (*pkt)->flags &= ~CI_PKT_FLAG_XDP_DROP;
-    ci_netif_pkt_release_rx_1ref(ni, *pkt);
-    *pkt = NULL;
-    return 0;
-  }
-  return 1;
-}
-#define oo_xdp_check_pkt oo_xdp_check_pkt
-#endif
-#endif
-
-#ifndef oo_xdp_check_pkt
-#if ! defined(__KERNEL__) && CI_CFG_WANT_BPF_NATIVE
-ci_inline int oo_xdp_check_pkt(ci_netif* ni, int intf_i, ci_ip_pkt_fmt** pkt)
-{
-  if( NI_OPTS(ni).xdp_mode != 0 &&
-      ((*pkt)->flags & CI_PKT_FLAG_XDP_DROP) ) {
-    /* just drop */
-    (*pkt)->flags &= ~CI_PKT_FLAG_XDP_DROP;
-    ci_netif_pkt_release_rx_1ref(ni, *pkt);
-    *pkt = NULL;
-    return 0;
-  }
-  return 1;
-}
-#else
-ci_inline int oo_xdp_check_pkt(ci_netif* ni, int intf_i, ci_ip_pkt_fmt** pkt)
-{
-  return 1;
-}
-#endif
-#endif
-
-
-ci_inline void __handle_rx_pkt(ci_netif* ni, struct ci_netif_poll_state* ps,
-                              int intf_i, ci_ip_pkt_fmt** pkt)
-{
-  if( *pkt != NULL && oo_xdp_check_pkt(ni, intf_i, pkt) ) {
-    ci_parse_rx_vlan(*pkt);
-    handle_rx_pkt(ni, ps, *pkt);
-  }
-}
-
-
 static int ci_netif_poll_evq(ci_netif* ni, struct ci_netif_poll_state* ps,
                              int intf_i, int n_evs)
 {
@@ -1468,6 +1465,11 @@ static int ci_netif_poll_evq(ci_netif* ni, struct ci_netif_poll_state* ps,
       break;
 
 have_events:
+    /* This loop is implemented with a 1 packet lag on processing (i.e.
+     * __handle_rx_pkt() is called for the packet from the previous loop
+     * iteration just as the next packet is being picked up, due to a
+     * measured benefit from allowing the CPU more time to prefetch the
+     * relevant cache lines from L3. */
     s.rx_pkt = NULL;
     for( i = 0; i < n_evs; ++i ) {
       /* Look for RX events first to minimise latency. */

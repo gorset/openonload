@@ -49,6 +49,12 @@ RESOURCE_TARGET_SRCS := $(RESOURCE_SRCS) $(EFHW_SRCS) $(EFRM_SRCS)
 
 TARGETS		:= $(RESOURCE_TARGET)
 
+x86_TARGET_SRCS   := syscall_x86.o
+i386_TARGET_SRCS    := $(x86_TARGET_SRCS)
+x86_64_TARGET_SRCS := $(x86_TARGET_SRCS)
+
+arm64_TARGET_SRCS := syscall_aarch64.o
+
 
 
 
@@ -57,6 +63,10 @@ TARGETS		:= $(RESOURCE_TARGET)
 #
 
 KBUILD_EXTRA_SYMBOLS := $(BUILDPATH)/driver/linux_affinity/Module.symvers
+ifeq ($(shell grep -s efx_dl_init_txq $(KBUILD_EXTRA_SYMBOLS)),)
+# Linux-5.8 does not include resource symbols into char's symvers file.
+KBUILD_EXTRA_SYMBOLS += $(BUILDPATH)/driver/linux_net/Module.symvers
+endif
 
 all: $(KBUILD_EXTRA_SYMBOLS)
 	$(MAKE) $(MMAKE_KBUILD_ARGS) M=$(CURDIR)
@@ -74,6 +84,6 @@ ifdef MMAKE_IN_KBUILD
 
 obj-m := $(RESOURCE_TARGET) 
 
-sfc_resource-objs := $(RESOURCE_TARGET_SRCS:%.c=%.o)
+sfc_resource-objs := $(RESOURCE_TARGET_SRCS:%.c=%.o) $($(ARCH)_TARGET_SRCS:%.c=%.o)
 
 endif # MMAKE_IN_KBUILD

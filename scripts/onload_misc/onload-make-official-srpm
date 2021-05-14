@@ -51,14 +51,9 @@ done
 [ $# = 1 ] || usage
 tarball="$1"
 
-# We build Onload source rpm on RHEL5 or RHEL6, as the srpm then seems to work
-# fine on other supported distros.
-try egrep -q "Red Hat Enterprise Linux.*release [56]|CentOS release [56]" \
+# We build Onload source rpm on RHEL6 as the earliest supported distro
+try egrep -q "Red Hat Enterprise Linux.*release 6|CentOS (Linux )*release 6" \
   /etc/redhat-release
-
-# We must be root, else get problems at install time.
-try [ "$UID" = 0 ]
-try [ "$USER" = root ]
 
 tmpd=
 trap cleanup EXIT
@@ -82,7 +77,7 @@ try sed -i \
   -e "/^#Packager\s*:/ cPackager$tab: Solarflare Communications, Inc." \
   "$distd/scripts/onload_misc/openonload.spec"
 tarball=$(basename "$tarball")
-try tar czf "$tarball" "$distd"
+try tar czf "$tarball" --owner=root --group=root "$distd"
 
 # Build source rpm.
 try mkdir -p rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}

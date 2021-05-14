@@ -482,7 +482,7 @@ static void efx_recycle_rx_buf(struct efx_rx_queue *rx_queue,
 
 	/* Since removed_count is updated after packet processing the
 	 * following can happen here:
-	 *   added_count > removed_count + efx->rxq_entries
+	 *   added_count > removed_count + rx_queue->ptr_mask + 1
 	 * efx_fast_push_rx_descriptors() asserts this is not true.
 	 * efx_fast_push_rx_descriptors() is only called at the end of
 	 * a NAPI poll cycle, at which point removed_count has been updated.
@@ -625,7 +625,7 @@ void efx_fast_push_rx_descriptors(struct efx_rx_queue *rx_queue, bool atomic)
 
 	/* Calculate current fill level, and exit if we don't need to fill */
 	fill_level = (rx_queue->added_count - rx_queue->removed_count);
-	EFX_WARN_ON_ONCE_PARANOID(fill_level > rx_queue->efx->rxq_entries);
+	EFX_WARN_ON_ONCE_PARANOID(fill_level > rx_queue->ptr_mask + 1);
 	if (fill_level >= rx_queue->fast_fill_trigger)
 		goto out;
 
@@ -717,7 +717,6 @@ efx_rx_packet_gro(struct efx_channel *channel, struct efx_rx_buffer *rx_buf,
 	struct efx_rx_buffer *head_buf = rx_buf;
 #endif
 	struct napi_struct *napi = &channel->napi_str;
-	gro_result_t gro_result;
 	struct efx_nic *efx = channel->efx;
 	struct sk_buff *skb;
 
@@ -776,16 +775,12 @@ efx_rx_packet_gro(struct efx_channel *channel, struct efx_rx_buffer *rx_buf,
 #if IS_ENABLED(CONFIG_VLAN_8021Q)
 #if defined(EFX_USE_KCOMPAT) && defined(EFX_HAVE_VLAN_RX_PATH)
 	if (head_buf->flags & EFX_RX_BUF_VLAN_XTAG)
-		gro_result = vlan_gro_frags(napi, efx->vlan_group,
-					    head_buf->vlan_tci);
+		vlan_gro_frags(napi, efx->vlan_group, head_buf->vlan_tci);
 	else
 		/* fall through */
 #endif
 #endif
-		gro_result = napi_gro_frags(napi);
-
-	if (gro_result != GRO_DROP)
-		channel->irq_mod_score += 2;
+		napi_gro_frags(napi);
 }
 
 #endif /* EFX_USE_GRO */
@@ -1116,10 +1111,14 @@ static bool efx_do_xdp(struct efx_nic *efx, struct efx_channel *channel,
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_XDP_TX)
 	case XDP_TX:
 		/* Buffer ownership passes to tx on success. */
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_XDP_COVERT_XDP_BUFF_FRAME_API)
+		xdpf = xdp_convert_buff_to_frame(&xdp);
+#else
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_XDP_FRAME_API)
 		xdpf = convert_to_xdp_frame(&xdp);
 #else
 		xdpf = &xdp;
+#endif
 #endif
 		rc = efx_xdp_tx_buffers(efx, 1, &xdpf, true);
 		if (rc != 1) {
@@ -1256,7 +1255,15 @@ void __efx_rx_packet(struct efx_channel *channel)
 #if defined(EFX_USE_KCOMPAT) && defined(EFX_WANT_DRIVER_BUSY_POLL)
 	    !efx_channel_busy_polling(channel) &&
 #endif
-	    (!efx_should_copy_rx_packet(rx_buf) || napi->gro_bitmask))
+#if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_NAPI_GRO_BITMASK)
+#if defined(EFX_HAVE_NAPI_GRO_LIST_SK_BUFF)
+            (!efx_should_copy_rx_packet(rx_buf) || napi->gro_list))
+#else
+            (!efx_should_copy_rx_packet(rx_buf) || !list_empty(&napi->gro_list)))
+#endif
+#else
+            (!efx_should_copy_rx_packet(rx_buf) || napi->gro_bitmask))
+#endif
 		efx_rx_packet_gro(channel, rx_buf, channel->rx_pkt_n_frags, eh);
 	else
 #endif
@@ -1343,7 +1350,7 @@ int efx_init_rx_queue(struct efx_rx_queue *rx_queue)
 #endif
 
 	/* Initialise limit fields */
-	max_fill = efx->rxq_entries - EFX_RXD_HEAD_ROOM;
+	max_fill = rx_queue->ptr_mask + 1 - EFX_RXD_HEAD_ROOM;
 	max_trigger =
 		max_fill - efx->rx_pages_per_batch * efx->rx_bufs_per_page;
 	if (rx_refill_threshold != 0) {
@@ -1367,7 +1374,7 @@ int efx_init_rx_queue(struct efx_rx_queue *rx_queue)
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_XDP_RXQ_INFO)
 	/* Initialise XDP queue information */
 	rc = xdp_rxq_info_reg(&rx_queue->xdp_rxq_info, efx->net_dev,
-			      rx_queue->core_index);
+			      rx_queue->core_index, 0);
 	if (rc)
 		return rc;
 #endif

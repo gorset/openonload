@@ -365,18 +365,13 @@ efx_ioctl_ts_read(struct efx_nic *efx, union efx_ioctl_data *data)
 #ifdef EFX_NOT_UPSTREAM
 
 static int
-efx_ioctl_get_ts_config(struct efx_nic *efx, union efx_ioctl_data *data)
+efx_ioctl_get_ts_config(struct efx_nic *efx, union efx_ioctl_data __user *user_data)
 {
-	mm_segment_t old_fs;
 	struct ifreq ifr;
-	int rc;
 
-	ifr.ifr_data = &data->ts_init;
-	old_fs = get_fs();
-	set_fs(KERNEL_DS);
-	rc = efx_ptp_get_ts_config(efx, &ifr);
-	set_fs(old_fs);
-	return rc;
+	/* ifr_data is declared as __user */
+	ifr.ifr_data = &user_data->ts_init;
+	return efx_ptp_get_ts_config(efx, &ifr);
 }
 
 static int
@@ -439,12 +434,6 @@ static int
 efx_ioctl_get_pps_event(struct efx_nic *efx, union efx_ioctl_data *data)
 {
 	return efx_ptp_pps_get_event(efx, &data->pps_event);
-}
-
-static int
-efx_ioctl_hw_pps_enable(struct efx_nic *efx, union efx_ioctl_data *data)
-{
-	return efx_ptp_hw_pps_enable(efx, &data->pps_enable);
 }
 #endif
 
@@ -728,9 +717,8 @@ int efx_private_ioctl(struct efx_nic *efx, u16 cmd,
 #endif
 #if defined(EFX_NOT_UPSTREAM)
 	case EFX_GET_TS_CONFIG:
-		size = sizeof(data->ts_init);
-		op = efx_ioctl_get_ts_config;
-		break;
+		return efx_ioctl_get_ts_config(efx, user_data);
+
 	case EFX_TS_SETTIME:
 		size = sizeof(data->ts_settime);
 		op = efx_ioctl_ts_settime;
@@ -773,9 +761,8 @@ int efx_private_ioctl(struct efx_nic *efx, u16 cmd,
 		op = efx_ioctl_get_pps_event;
 		break;
 	case EFX_TS_ENABLE_HW_PPS:
-		size = sizeof(data->pps_enable);
-		op = efx_ioctl_hw_pps_enable;
-		break;
+		/* This no longer does anything, PPS is always enabled */
+		return 0;
 #endif
 #ifdef CONFIG_SFC_AOE
 	case EFX_UPDATE_CPLD:

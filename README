@@ -7,7 +7,7 @@ Introduction
  sockets API.  Please see www.openonload.org for more information.
 
  EnterpriseOnload is a version of OpenOnload that includes an extended test
- cycle, guaranteed support from Solarflare, bug fixes and a defined service
+ cycle, guaranteed support from Xilinx, bug fixes and a defined service
  level agreement.
 
  OpenOnload and EnterpriseOnload are licensed under the GNU General Public
@@ -18,12 +18,11 @@ Introduction
 Supported platforms
 ===================
 
- Linux kernels from 3.10.
+ Linux kernels from 4.4.
 
  The following processor architectures are supported:
  - amd64/em64t (support for AMD processors prior to Zen is deprecated)
  - ia32 (in userspace for Onloaded applications only)
- - aarch64 (to preview level)
 
  Onload supports Solarflare SFC9000 network controller chips,
  including the following network adapters:
@@ -34,23 +33,15 @@ Supported platforms
    SFN7142Q
    SFN7122F, SFN7322F, SFN7124F
 
- Onload support for the following network adapters is deprecated:
-   SFN5122F, SFN5322F
-   SFN6122F, SFN6322F
-   SFN5812H, SFN5814H
-   SFN5802K
-   SFN5121T
-
-
  If you are interested in trying or buying Solarflare network adapters,
- please contact <sales@solarflare.com>.
+ please contact <nic-sales@xilinx.com>.
 
 
 Documentation
 =============
 
  The Onload User Guide is available to customers with supported cards.  You
- can register and download a copy from: https://support.solarflare.com/.
+ can register and download a copy from: https://support-nic.xilinx.com/.
 
  You may also find the Server Adapter User Guide useful -- it is available from
  the same place.
@@ -112,13 +103,11 @@ Configuration and tuning
 Any questions?
 ==============
 
- Website: www.openonload.org
-
- For support please go to https://support.solarflare.com or email
- <support@solarflare.com>.
+ For support please go to https://support-nic.xilinx.com or email
+ <support-nic@xilinx.com>.
 
 
 ==========
- version: onload-7.1.0.265
-revision: bd4c2f69606ebe414a12c363d430e1c42e437464
-    date: Tue  5 May 10:27:27 BST 2020
+ version: onload-7.1.1.75
+revision: 154a96ec6c9ab72f3b4e7e968c5654fdc110dc86
+    date: Mon 22 Mar 11:47:42 GMT 2021

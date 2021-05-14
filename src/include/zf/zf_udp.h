@@ -89,7 +89,13 @@ zfur_free(struct zfur* us);
 ** If the specified local address is multicast then this has the effect of
 ** joining the multicast group as well as setting the filter.  The group
 ** membership will persist until either the address is unbound (see
-** zfur_addr_unbind()), or the zocket is closed.
+** zfur_addr_unbind()), or the zocket is closed. If a raddr address is provided
+** which isn't INADDR_ANY then the multicast group membership will be established
+** in SSM mode.
+**
+** If a remote port number of 0 is provided along with a remote address and a given
+** multicast local address then a wild match hardware/software filter will be added.
+** Otherwise without a local multicast addr, this function will return -EINVAL.
 */
 ZF_LIBENTRY ZF_COLD int
 zfur_addr_bind(struct zfur* us, struct sockaddr* laddr,

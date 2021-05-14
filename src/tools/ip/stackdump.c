@@ -374,13 +374,11 @@ static void print_docs(int argc, char* argv[])
 /* The CI_CFG_* options are dumped by the build process into an object file
  * with the following symbols. */
 extern char _binary_onload_config_start[];
-extern int _binary_onload_config_size;
+extern char _binary_onload_config_end[];
 
 static void print_config(void)
 {
-  /* The size is the _address_ of the _binary_onload_config_size symbol, for
-   * reasons best known to the linker. */
-  int len = (int) (uintptr_t) &_binary_onload_config_size;
+  int len = _binary_onload_config_end - _binary_onload_config_start;
   printf("%.*s", len, _binary_onload_config_start);
 }
 
@@ -562,13 +560,14 @@ static void debug_print_stacks(void)
 {
   int i = 0;
   char buffer[1024];
-  int next_buffer = 0;
-  next_buffer += sprintf(buffer, "stacks [");
+  int next_buffer = 0, len = sizeof(buffer);
+  next_buffer += ci_scnprintf(buffer, len, "stacks [");
   while( i < s_stack_idx_count + 1 ) {
-    next_buffer += sprintf(buffer + next_buffer, " %d", s_stack_idx_col[i]);
+    next_buffer += ci_scnprintf(buffer + next_buffer, len - next_buffer, " %d",
+                                s_stack_idx_col[i]);
     ++i;
   }
-  next_buffer += sprintf(buffer + next_buffer, " ]");
+  snprintf(buffer + next_buffer, len - next_buffer, " ]");
   STACK_LOG_DUMP(ci_log(" [%s %d] %s", __func__, __LINE__, buffer));
 }
 

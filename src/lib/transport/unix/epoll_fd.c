@@ -214,10 +214,12 @@ static int citp_epoll_sb_state_alloc(citp_socket* sock)
   ci_sb_epoll_state* epoll;
   int i;
 
-  if( OO_PP_NOT_NULL(sock->s->b.epoll) )
-    return 0;
-
   ci_netif_lock(sock->netif);
+  if( OO_PP_NOT_NULL(sock->s->b.epoll) ) {
+    ci_netif_unlock(sock->netif);
+    return 0;
+  }
+
   sp = ci_ni_aux_alloc(sock->netif, CI_TCP_AUX_TYPE_EPOLL);
   if( OO_PP_NOT_NULL(sp) ) {
     sock->s->b.epoll = sp;
@@ -1724,6 +1726,19 @@ static ci_uint64 timeout_hr_to_us(ci_int64 hr)
 #error "Can not implement epoll_pwait() without ppoll()"
 #endif
 
+/* Synchronise state to kernel if:
+   - EF_EPOLL_CTL_FAST=0;
+   - or we are going to block (timeout != 0 && rc == 0) */
+ci_inline void
+citp_epoll_ctl_try_sync(struct citp_epoll_fd* ep, citp_fdinfo* fdi,
+                        ci_int64 timeout_hr, int rc)
+{
+  if( ep->epfd_syncs_needed &&
+      ( ! CITP_OPTS.ul_epoll_ctl_fast || (rc == 0 && timeout_hr != 0) ) )
+    citp_ul_epoll_ctl_sync(ep, fdi->fd);
+}
+
+
 int citp_epoll_wait(citp_fdinfo* fdi, struct epoll_event*__restrict__ events,
                     struct citp_ordered_wait* ordering, int maxevents,
                     ci_int64 timeout_hr, const sigset_t *sigmask,
@@ -1731,7 +1746,7 @@ int citp_epoll_wait(citp_fdinfo* fdi, struct epoll_event*__restrict__ events,
 {
   struct citp_epoll_fd* ep = fdi_to_epoll(fdi);
   struct oo_ul_epoll_state eps;
-  ci_uint64 poll_start_frc;
+  ci_uint64 base_poll_start_frc, poll_start_frc;
   int rc = 0, rc_os = 0;
 #if CI_LIBC_HAS_epoll_pwait
   sigset_t sigsaved;
@@ -1797,8 +1812,11 @@ int citp_epoll_wait(citp_fdinfo* fdi, struct epoll_event*__restrict__ events,
   }
 
   /* Set up epoll state */
-  ci_frc64(&poll_start_frc);
-  eps.this_poll_frc = poll_start_frc;
+  ci_frc64(&base_poll_start_frc);
+  /* base_poll_start_frc keeps the base timestamp of poll start and
+   * poll_start_frc keeps the updated value because we should to update it
+   * both with timeout_hr re-calculation. See citp_epoll_find_timeout().*/
+  eps.this_poll_frc = poll_start_frc = base_poll_start_frc;
   eps.ep = ep;
   eps.events = events;
   eps.events_top = events + maxevents;
@@ -1949,7 +1967,7 @@ no_events:
   }
 
   /* Blocking.  Shall we spin? */
-  if( KEEP_POLLING(eps.ul_epoll_spin, eps.this_poll_frc, poll_start_frc) ) {
+  if( KEEP_POLLING(eps.ul_epoll_spin, eps.this_poll_frc, base_poll_start_frc) ) {
 #if CI_LIBC_HAS_epoll_pwait
     if( !pwait_was_spinning && sigmask != NULL) {
       if( ep->avoid_spin_once ) {
@@ -2008,10 +2026,13 @@ no_events:
     if( CITP_OPTS.sleep_spin_usec ) {
       struct oo_epoll1_block_on_arg op = {};
       op.epoll_fd = fdi->fd;
-      /* do not spend too much time spinning in kernel */
       op.timeout_us = timeout_hr_to_us(timeout_hr);
       op.sleep_iter_us = CITP_OPTS.sleep_spin_usec;
+
+      citp_epoll_ctl_try_sync(ep, fdi, timeout_hr, 0);
+
       rc = ci_sys_ioctl(ep->epfd_os, OO_EPOLL1_IOC_SPIN_ON, &op);
+      citp_epoll_find_timeout(&timeout_hr, &poll_start_frc);
       Log_POLL(ci_log("%s(%d): SPIN ON %d ", __FUNCTION__, fdi->fd, op.flags));
     }
     goto poll_again;
@@ -2020,6 +2041,7 @@ no_events:
   /* Re-calculate timeout.  We should do it if we were spinning a lot. */
   if( eps.ul_epoll_spin && timeout_hr > 0 ) {
     timeout_hr -= eps.this_poll_frc - poll_start_frc;
+    poll_start_frc = eps.this_poll_frc;
     timeout_hr = CI_MAX(timeout_hr, 0);
     Log_POLL(ci_log("%s: blocking timeout reduced to %" CI_PRId64,
                     __FUNCTION__, timeout_hr));
@@ -2027,10 +2049,8 @@ no_events:
 
  unlock_release_exit_ret:
   /* Synchronise state to kernel (if necessary) and block. */
-  if( ep->epfd_syncs_needed &&
-      ( ! CITP_OPTS.ul_epoll_ctl_fast || (rc == 0 && timeout_hr != 0) ) ) {
-    citp_ul_epoll_ctl_sync(ep, fdi->fd);
-  }
+  citp_epoll_ctl_try_sync(ep, fdi, timeout_hr, rc);
+
   CITP_EPOLL_EP_UNLOCK(ep, 0);
   Log_POLL(ci_log("%s(%d): to kernel", __FUNCTION__, fdi->fd));
 

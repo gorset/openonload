@@ -17,7 +17,8 @@
 #include <onload/debug.h>
 #include <onload/shmbuf.h>
 
-
+#ifndef EFRM_HAVE_ALLOC_VM_AREA_WITH_PTES
+/* RHEL6 only */
 static int map_page(void* addr, struct page* page, pgprot_t prot)
 {
   /* There's no interface for doing this, so we use ugly trickery. Might break
@@ -46,6 +47,7 @@ static int map_page(void* addr, struct page* page, pgprot_t prot)
 #endif
                      );
 }
+#endif
 
 
 int ci_shmbuf_alloc(ci_shmbuf_t* b, unsigned n_pages, unsigned n_fault_pages)
@@ -57,10 +59,12 @@ int ci_shmbuf_alloc(ci_shmbuf_t* b, unsigned n_pages, unsigned n_fault_pages)
   ci_assert_ge(n_fault_pages, 1);
 
   b->n_pages = n_pages;
-  b->base = NULL;
   b->pages = vzalloc(n_pages * sizeof(b->pages[0]));
   if( ! b->pages )
     return -ENOMEM;
+
+#ifndef EFRM_HAVE_ALLOC_VM_AREA_WITH_PTES
+  b->base = NULL;
 
   for( i = 0; i < n_fault_pages; ++i ) {
     b->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
@@ -102,6 +106,26 @@ int ci_shmbuf_alloc(ci_shmbuf_t* b, unsigned n_pages, unsigned n_fault_pages)
 
   for( i = n_fault_pages; i < n_pages; ++i )
     b->pages[i] = NULL;
+#else
+  /* linux >= 3.2 */
+  b->ptes = vzalloc(n_pages * sizeof(b->ptes[0]));
+  if( ! b->ptes ) {
+    vfree(b->pages);
+    return -ENOMEM;
+  }
+
+  b->vm = alloc_vm_area(n_pages << PAGE_SHIFT, b->ptes);
+  if( ! b->vm ) {
+    ci_shmbuf_free(b);
+    return -ENOMEM;
+  }
+
+  for( i = 0; i < n_fault_pages; ++i )
+    if( ci_shmbuf_demand_page(b, i) != 0 ) {
+      ci_shmbuf_free(b);
+      return -ENOMEM;
+    }
+#endif
 
   return 0;
 }
@@ -112,32 +136,54 @@ void ci_shmbuf_free(ci_shmbuf_t* b)
   unsigned i;
 
   ci_assert(b);
-  ci_assert(b->base);
   ci_assert(b->pages);
+
+#ifndef EFRM_HAVE_ALLOC_VM_AREA_WITH_PTES
+  ci_assert(b->base);
+#else
+  if( b->vm )
+    free_vm_area(b->vm);
+  b->vm = NULL;
+#endif
 
   for( i = 0; i < b->n_pages; ++i )
     if( b->pages[i] )
       __free_page(b->pages[i]);
 
+#ifndef EFRM_HAVE_ALLOC_VM_AREA_WITH_PTES
   vunmap(b->base);
-  vfree(b->pages);
   b->base = NULL;
+#endif
+  vfree(b->pages);
   b->pages = NULL;
+#ifdef EFRM_HAVE_ALLOC_VM_AREA_WITH_PTES
+  vfree(b->ptes);
+  b->ptes = NULL;
+#endif
 }
 
 
-int ci_shmbuf_demand_page(ci_shmbuf_t* b, unsigned page_i,
-			       ci_irqlock_t* lock)
+int ci_shmbuf_demand_page(ci_shmbuf_t* b, unsigned page_i
+#ifndef EFRM_HAVE_ALLOC_VM_AREA_WITH_PTES
+                          , ci_irqlock_t* lock
+#endif
+                          )
 {
   ci_assert(b);
-  ci_assert(b->base);
   ci_assert(b->pages);
   ci_assert(page_i < b->n_pages);
+
+#ifndef EFRM_HAVE_ALLOC_VM_AREA_WITH_PTES
+  ci_assert(b->base);
+#else
+  ci_assert(b->vm);
+#endif
 
   if( ! b->pages[page_i] ) {
     struct page* p = alloc_page(__GFP_ZERO |
                                 (in_interrupt() ? GFP_ATOMIC : GFP_KERNEL));
     if( p ) {
+#ifndef EFRM_HAVE_ALLOC_VM_AREA_WITH_PTES
       ci_irqlock_state_t lock_flags;
       ci_irqlock_lock(lock, &lock_flags);
       if( ! b->pages[page_i] ) {
@@ -158,6 +204,12 @@ int ci_shmbuf_demand_page(ci_shmbuf_t* b, unsigned page_i,
       ci_irqlock_unlock(lock, &lock_flags);
       if( p )
         __free_page(p);
+#else
+      if( cmpxchg(&b->pages[page_i], NULL, p) == 0 )
+        *b->ptes[page_i] = mk_pte(p, PAGE_KERNEL);
+      else
+        __free_page(p);
+#endif
       return 0;
     }
     OO_DEBUG_VM(ci_log("%s: out of memory", __FUNCTION__));

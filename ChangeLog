@@ -1,5 +1,46 @@
-onload-7.1.0
+onload-7.1.1
 ------------
+
+Update sfc net driver to v4.15.12.1008
+
+Support recent kernel.org kernel versions (up to 5.9)
+Support recent GCC compilers (up to 10)
+Support recent Linux distributions:
+  RHEL 7.9, 8.3
+  SLES15 sp2
+Remove support for:
+  RHEL 6.8, 7.5, 8.0
+  SLES15 base
+  Ubuntu LTS 16.04
+  kernel.org kernel versions 3.10-4.3
+
+Features:
+
+ON-12532: add option to control how sends are combined in packets
+ON-12688: allow restricted features also on secondary group match (egid)
+
+Bug fixes:
+
+ON-11555: TCPDirect: support SSM with unspecified source port
+ON-12017/ON-12476/ON-12790: fix various timeout calculations in latency profile
+ON-12062: replace close() with ci_sys_close() in libonload init
+ON-12123: remove unnecessary Onload dependency in ef_vi
+ON-12267: fix several cases where XDP rx processing got bypassed
+ON-12346: default to not installing onload as setuid.
+ON-12421: fix occasional ENOMEM when re-adding new socket to epoll mode 2 set
+ON-12471: TCPDirect: ensure low-latency firmware mode always recognised
+ON-12511: TCPDirect: ensure delegated send has buffer to complete at preparation
+ON-12543: avoid string function usage that looks unsafe to tools
+ON-12566/ON-12598: fix rare issues affecting Nginx Onload profile
+ON-12597/ON-12644: TCPDirect: multiple fixes in timestamp handling
+ON-12736: fix allocation failure manifesting in ci_tcp_helper_more_bufs()
+ON-12737: avoid unnecessary control plane lookups, leading to jitter
+ON-12839: avoid unnecessary window updates, appearing as duplicate ACKs to peer
+ON-12903: TCPDirect: ensure out-of-order segments prompt duplicate ACKs
+
+
+onload-7.1.0.265
+----------------
 
 Update sfc net driver to v4.15.6.1004
 
@@ -2182,6 +2223,126 @@ openonload-20101111-u1
 - Avoid unnecessary control plane sys-calls when ARP entries are static.
 - bug21575: Fix rare deadlock in kernel driver.
 - Update to v3_0_8_2221 sfc driver.
+
+In detail:
+
+- More distributions supported by RPMs.
+
+- Performance improvement for UDP multicast sends.
+
+- bug21384: Fixed bug in synchronisation with kernel control plane.
+   A race between polling for rtnl updates (to discover when things have
+   changed), and updating onload routing tables based on the kernel's ipif
+   table.  The symptoms would be benign, apart from verbose error messages of
+   the ilk:
+    [onload] cicpos_handle_ipif_msg: cicpos_ipif_delete failed, rc=-61
+   and:
+    [onload] cicpos_ipif_import: 243 2103a8c0 1b
+
+- bug21271: Fix handling of signals when waiting for memory.
+   If the process received a signal while allocating packet buffers, it could
+   result in the allocation failing in a way not anticipated by the calling
+   code, leading to an assertion failure and termination of the process in
+   question, or possibly a kernel panic.
+
+- bug21309: Fix kernel driver livelock bug. 
+   A race condition only on real-time kernels.  Incorrect locking order would
+   cause an unbounded (typically a few seconds) live-lock of a single CPU core.
+
+- bug19843: Fixed case where gateway mac was used instead of m'cast mac.
+   Only use the gateway MAC address for multicast traffic when the socket
+   is not bound to a local IP and not connected.  Previously Onload would
+   use the gateway MAC whenever the selected route had a gateway.
+
+- bug21509: Sometimes IP_ADD_MEMBERSHIP would fail to accelerate
+   If interface was chosen via route table, the multicast transmissions would
+   not necessarily be accelerated when they could/should have been (whether or
+   not acceleration happened depended on state in the control plane, and was
+   effectively non-deterministic.)
+
+- bug18845: Improved handling when short of packet buffers.
+   The NIC has a finite number of "packet buffers", used to allow usermode
+   applications safely to DMA to or from the NIC, even without the presence of
+   an IOMMU.  If these packet buffers are exhausted (e.g. because sockets with
+   large receive buffers are receiving traffic but the app is not reading), then
+   in some cases applications cannot allocate buffers to transmit and so do not
+   make progress (i.e. deadlock).  This change provides more intelligent
+   management on low packet buffer situations so that either (a) the stack is
+   not created in the first place (and so sockets are handed over to the kernel
+   (i.e. not accelerated), and/or (b) RX descriptor rings are dynamically
+   resized, and/or (c) early discard of RX packets in critically low memory
+   scenarios
+
+- Added canned configuration profiles.
+   Rather than starting app foo as `onload foo' one can now say `onload
+   --profile=latency foo' in order to use the predefined profile optimized for
+   latency.  Further tuning can still be beneficial, but profiles can achieve
+   good performance results with minimial configuration/tuning effort.
+
+- New statistics added to "onload_stackdump stats".
+   Number of loop-back multicast sends
+   Number of loop-back multicast drops
+   Number of packet buffers freed by reaping
+   Number of times MSS has been forcibly limited
+   Number of times stack has experienced "memory pressure" (see bug18845)
+   Number of times stack has been polled while under memory pressure
+   Number of packets dropped due to memory pressure
+
+- EF_MAX_PACKETS is no longer rounded to a power of 2.
+   Now may take any number in the range 0..32767
+
+- Use "onload_tool reload" to reload drivers.
+   onload_loaddrivers is deprecated.
+
+- No longer disable CPU low power states by default.
+   Use "onload_tool disable_cstates [persist]" to re-enable.
+
+- bug21634: Fix bug when multiple sockets subscribe to same multicast stream.
+   If multiple sockets were to subscribe to the same multicast stream then
+   depending on timing it was possible that none, some or all of them may be
+   accelerated.  In the case some were accelerated and some not, this could
+   result in some receivers not receiving the traffic.
+
+- bug21643: Uncorking TCP socket would sometimes delay sending data.
+   A race condition meant that uncorking a TCP socket that had previously been
+   corked with TCP_CORK may occasionally not immediately send data, leading to
+   occasional high latencies.
+
+- Make ef_vi robust to certain errors in event notifications.
+   "defensive code" to cope better with bugs in the setting up of the hardware.
+   (Since there are no known such bugs in the hardware, no user-observable
+   difference is anticipated.)
+
+- Minor change in ef_vi interface.
+   ef_vi_receive_done() replaced with EF_EVENT_RX_RQ_ID().
+
+- bug21103: Suppress constantly repeating error messages.
+   Certain conditions, such as out of resources, could result in a flood of
+   messages to the kernel logs.  Most such messages are now throttled to one per
+   second or one per netif or one per socket.
+
+- Support up to 6 accelerated network interfaces by default.
+   Changed CI_CFG_MAX_INTERFACES.  Previously defined as 4.
+
+- Fixed dimensioning of state when many accelerated interfaces supported.
+   A bug if different interfaces had different physical resources (e.g. using
+   two different adapter hardware models in the same machine) could lead to
+   dropped packets or the onload stack becoming stuck (i.e. deadlocked).
+
+- Improve performance of send/recv etc. when file descriptor not accelerated.
+   Minimised the overhead of the onload intercept library when the fd passed is
+   not an onload fd.
+
+- Avoid unnecessary control plane sys-calls when ARP entries are static.
+   Avoids significant latency jitter when static ARP entries are used.
+
+- bug21575: Fix rare deadlock in kernel driver.
+   Control plane update code had an assumption that a thread holding a spinlock
+   would be non-preemptable.  On real-time kernels this is not necessarily true,
+   and there was a very fine race which if it could result to live lock of a CPU
+   core.
+
+- Update to v3_0_8_2221 sfc (i.e. net) driver.
 
 
 openonload-20101111

@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/* X-SPDX-Copyright-Text: (c) Solarflare Communications Inc */
+/* SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause */
+/* X-SPDX-Copyright-Text: (c) Copyright 2002-2020 Xilinx, Inc. */
 /****************************************************************************
  * Copyright 2002-2005: Level 5 Networks Inc.
  * Copyright 2005-2008: Solarflare Communications Inc,
@@ -136,17 +136,17 @@ extern int  ci_log_options  CI_HV;
 
 extern char ci_printable_char(char c) CI_HF;
 
-extern void (*ci_hex_dump_formatter)(char* buf, const ci_octet* s,
+extern void (*ci_hex_dump_formatter)(char* buf, int buf_len, const ci_octet* s,
 				     int i, int off, int len) CI_HV;
-extern void ci_hex_dump_format_octets(char*,const ci_octet*,int,int,int) CI_HF;
-extern void ci_hex_dump_format_single_octets(char*,const ci_octet*,int,int,int) CI_HF;
-extern void ci_hex_dump_format_dwords(char*,const ci_octet*,int,int,int) CI_HF;
+extern void ci_hex_dump_format_octets(char*,int,const ci_octet*,int,int,int) CI_HF;
+extern void ci_hex_dump_format_single_octets(char*,int,const ci_octet*,int,int,int) CI_HF;
+extern void ci_hex_dump_format_dwords(char*,int,const ci_octet*,int,int,int) CI_HF;
 
-extern void (*ci_hex_dump_stringifier)(char* buf, const ci_octet* s,
+extern void (*ci_hex_dump_stringifier)(char* buf, int buf_len, const ci_octet* s,
 				       int offset, int len) CI_HV;
-extern void ci_hex_dump_format_stringify(char*,const ci_octet*,int,int) CI_HF;
+extern void ci_hex_dump_format_stringify(char*,int, const ci_octet*,int,int) CI_HF;
 
-extern void ci_hex_dump_row(char* buf, volatile const void* s, int len,
+extern void ci_hex_dump_row(char* buf, int buf_len, volatile const void* s, int len,
 			    ci_ptr_arith_t address) CI_HF;
   /*!< A row contains up to 16 bytes.  Row starts at [address & 15u], so
   ** therefore [len + (address & 15u)] must be <= 16.
@@ -163,7 +163,7 @@ extern int  ci_hex_dump_to_raw(const char* src_hex, void* buf,
   ** cope with missing bytes at the start of a line.
   */
 
-extern int ci_format_eth_addr(char* buf, const void* eth_mac_addr,
+extern int ci_format_eth_addr(char* buf, int len, const void* eth_mac_addr,
 			      char sep)  CI_HF;
   /*!< This will write 18 characters to <buf> including terminating null.
   ** Returns number of bytes written excluding null.  If [sep] is zero, ':'
@@ -176,7 +176,7 @@ extern int ci_parse_eth_addr(void* eth_mac_addr,
   ** inconsistent separators).  Returns 0 on success, -1 on error.
   */
 
-extern int ci_format_ip4_addr(char* buf, unsigned addr_be32) CI_HF;
+extern int ci_format_ip4_addr(char* buf, int len, unsigned addr_be32) CI_HF;
   /*!< Formats the IP address (in network endian) in dotted-quad.  Returns
   ** the number of bytes written (up to 15), excluding the null.  [buf]
   ** must be at least 16 bytes long.

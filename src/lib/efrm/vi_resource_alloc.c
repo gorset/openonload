@@ -679,8 +679,8 @@ efrm_vi_io_map(struct efrm_vi* virs, struct efhw_nic *nic, int instance)
 		break;
 	case EFHW_ARCH_EF10:
 		offset = instance * nic->vi_stride;
-		virs->io_page = ioremap_nocache(nic->ctr_ap_dma_addr +
-						offset, PAGE_SIZE);
+		virs->io_page = efx_ioremap(nic->ctr_ap_dma_addr +
+					    offset, PAGE_SIZE);
 		if (virs->io_page == NULL)
 			return -ENOMEM;
 		break;

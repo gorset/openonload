@@ -190,11 +190,17 @@ fail:
 	return rc;
 }
 
+static void mcdi_to_ethtool_linkset(struct efx_nic *efx, u32 media, u32 cap,
+				    unsigned long *linkset);
+
 static void efx_mcdi_set_link_completer(struct efx_nic *efx,
 					unsigned long cookie, int rc,
 					efx_dword_t *outbuf,
 					size_t outlen_actual)
 {
+	struct efx_mcdi_phy_data *phy_cfg = efx->phy_data;
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising);
+
 	/* EAGAIN means another MODULECHANGE event came in while we were
 	 * doing the SET_LINK. Ignore the failure, we should be
 	 * trying again shortly.
@@ -211,7 +217,8 @@ static void efx_mcdi_set_link_completer(struct efx_nic *efx,
 		return;
 	}
 
-	efx_link_set_advertising(efx, &cookie);
+	mcdi_to_ethtool_linkset(efx, phy_cfg->media, cookie, advertising);
+	efx_link_set_advertising(efx, advertising);
 }
 
 #define SET_LINK_SEQ_IGNORE (1 << MC_CMD_SET_LINK_IN_V2_MODULE_SEQ_IGNORE_LBN)
@@ -579,6 +586,12 @@ static u32 efx_get_mcdi_phy_flags(struct efx_nic *efx)
 		flags |= (1 << MC_CMD_SET_LINK_IN_LOWPOWER_LBN);
 	if (mode & PHY_MODE_OFF)
 		flags |= (1 << MC_CMD_SET_LINK_IN_POWEROFF_LBN);
+
+	/* Report administratively down if the netif is stopped
+	 * AND we actually registered it.
+	 */
+	if (efx->state != STATE_UNINIT && !netif_running(efx->net_dev))
+		flags |= (1 << MC_CMD_SET_LINK_IN_LINKDOWN_LBN);
 
 	return flags;
 }
@@ -1486,6 +1499,7 @@ static u32 efx_mcdi_phy_module_type(struct efx_nic *efx)
 		return MC_CMD_MEDIA_SFP_PLUS;
 	case 0xc:
 	case 0xd:
+	case 0x11:
 		return MC_CMD_MEDIA_QSFP_PLUS;
 	default:
 		return 0;
@@ -1952,6 +1966,8 @@ fail:
 
 void efx_mcdi_port_remove(struct efx_nic *efx)
 {
+	efx_mcdi_port_reconfigure(efx);
+
 	efx->phy_op->remove(efx);
 	kfree(efx->mc_initial_stats);
 	efx->mc_initial_stats = NULL;

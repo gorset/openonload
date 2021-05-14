@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
-/* X-SPDX-Copyright-Text: (c) Solarflare Communications Inc */
+/* X-SPDX-Copyright-Text: (c) Copyright 2016-2020 Xilinx, Inc. */
 /* eflatency
  *
  * Copyright 2016 Solarflare Communications Inc.
@@ -37,6 +37,14 @@ static int              cfg_warmups = 10000;
 static unsigned		cfg_payload_len = DEFAULT_PAYLOAD_SIZE;
 static int              cfg_ctpio_no_poison;
 static unsigned         cfg_ctpio_thresh = 64;
+enum mode {
+  MODE_DMA = 1,
+  MODE_PIO = 2,
+  MODE_ALT = 4,
+  MODE_CTPIO = 8,
+  MODE_DEFAULT = MODE_CTPIO | MODE_ALT | MODE_PIO | MODE_DMA
+};
+static unsigned         cfg_mode = MODE_DEFAULT;
 
 
 #define N_RX_BUFS	256u
@@ -190,7 +198,6 @@ static const test_t dma_test = {
   .pong = dma_pong,
   .cleanup = NULL,
 };
-
 
 
 /*
@@ -401,7 +408,8 @@ static const test_t* do_init(int ifindex)
     vi_flags |= EF_VI_TX_CTPIO_NO_POISON;
 
   /* Try with CTPIO first. */
-  if( ef_vi_capabilities_get(driver_handle, ifindex, EF_VI_CAP_CTPIO,
+  if( cfg_mode & MODE_CTPIO &&
+      ef_vi_capabilities_get(driver_handle, ifindex, EF_VI_CAP_CTPIO,
                              &capability_val) == 0 && capability_val ) {
     vi_flags |= EF_VI_TX_CTPIO;
     if( ef_vi_alloc_from_pd(&vi, driver_handle, &pd, driver_handle,
@@ -412,7 +420,8 @@ static const test_t* do_init(int ifindex)
   }
 
   /* Try with TX alternatives if CTPIO failed. */
-  if( ef_vi_capabilities_get(driver_handle, ifindex, EF_VI_CAP_TX_ALTERNATIVES,
+  if( cfg_mode & MODE_ALT &&
+      ef_vi_capabilities_get(driver_handle, ifindex, EF_VI_CAP_TX_ALTERNATIVES,
                              &capability_val) == 0 && capability_val ) {
     vi_flags |= EF_VI_TX_ALT;
     if( ef_vi_alloc_from_pd(&vi, driver_handle, &pd, driver_handle,
@@ -484,17 +493,21 @@ static const test_t* do_init(int ifindex)
   }
 #if EF_VI_CONFIG_PIO
   /* If we couldn't allocate an alternative, try PIO. */
-  else if( ef_pio_alloc(&pio, driver_handle, &pd, -1, driver_handle) == 0 ) {
+  else if( cfg_mode & MODE_PIO &&
+           ef_pio_alloc(&pio, driver_handle, &pd, -1, driver_handle) == 0 ) {
     TRY(ef_pio_link_vi(&pio, driver_handle, &vi, driver_handle));
     TRY(ef_pio_memcpy(&vi, pkt_bufs[FIRST_TX_BUF]->dma_buf, 0, tx_frame_len));
     t = &pio_test;
   }
 #endif
   /* In the worst case, fall back to DMA sends. */
-  else {
+  else if( cfg_mode & MODE_DMA ) {
     t = &dma_test;
   }
-
+  else {
+    fprintf(stderr, "No compatible mode found\n");
+    exit(1);
+  }
   return t;
 }
 
@@ -509,6 +522,8 @@ static CI_NORETURN usage(void)
   fprintf(stderr, "  -w <iterations>     - set number of warmup iterations\n");
   fprintf(stderr, "  -c <cut-through>    - CTPIO cut-through threshold\n");
   fprintf(stderr, "  -p                  - CTPIO no-poison mode\n");
+  fprintf(stderr, "  -m <modes>          - allow mode of the set: [c]tpio, \n");
+  fprintf(stderr, "                      [pio], [a]lternatives, [d]ma\n");
   fprintf(stderr, "\n");
   exit(1);
 }
@@ -523,7 +538,7 @@ int main(int argc, char* argv[])
 
   printf("# ef_vi_version_str: %s\n", ef_vi_version_str());
 
-  while( (c = getopt (argc, argv, "n:s:w:c:p")) != -1 )
+  while( (c = getopt (argc, argv, "n:s:w:c:pm:")) != -1 )
     switch( c ) {
     case 'n':
       cfg_iter = atoi(optarg);
@@ -539,6 +554,15 @@ int main(int argc, char* argv[])
       break;
     case 'p':
       cfg_ctpio_no_poison = 1;
+      break;
+    case 'm':
+      #define OPT_C(ch) (strchr(optarg, ch) != NULL)
+      cfg_mode =
+        OPT_C('c') * MODE_CTPIO |
+        OPT_C('a') * MODE_ALT |
+        OPT_C('p') * MODE_PIO |
+        OPT_C('d') * MODE_DMA;
+      #undef OPT_C
       break;
     case '?':
       usage();

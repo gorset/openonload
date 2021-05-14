@@ -72,18 +72,6 @@
 #define EPHEMERAL_PORT_LIST_NO_PORT ((uint32_t) -1)
 
 
-#ifdef EFRM_DO_NAMESPACES
-static void (*my_free_nsproxy)(struct nsproxy *ns);
-static inline void my_put_nsproxy(struct nsproxy *ns)
-{
-	if (atomic_dec_and_test(&ns->count)) {
-		my_free_nsproxy(ns);
-	}
-}
-
-#define put_nsproxy my_put_nsproxy
-#endif
-
 #define EFAB_THR_MAX_NUM_INSTANCES  0x00010000
 
 /* Provides upper limit to EF_MAX_PACKETS. default is 512K packets,
@@ -267,6 +255,9 @@ oo_trusted_lock_drop(tcp_helper_resource_t* trs, int in_dl_context)
                                    &trs->netif.state->ready_lists[i]))
           ci_waitable_wakeup_all(&trs->ready_list_waitqs[i]);
       }
+
+      if( in_dl_context )
+        ni->flags |= CI_NETIF_FLAG_IN_DL_CONTEXT;
       ci_netif_unlock(&trs->netif);
     }
     else {
@@ -286,10 +277,6 @@ oo_trusted_lock_drop(tcp_helper_resource_t* trs, int in_dl_context)
     sl_flags |= CI_EPLOCK_NETIF_SWF_UPDATE;
   if( l & OO_TRUSTED_LOCK_PURGE_TXQS )
     sl_flags |= CI_EPLOCK_NETIF_PURGE_TXQS;
-#if CI_CFG_WANT_BPF_NATIVE && CI_HAVE_BPF_NATIVE
-  if( l & OO_TRUSTED_LOCK_XDP_CHANGE )
-    sl_flags |= CI_EPLOCK_NETIF_XDP_CHANGE;
-#endif
   ci_assert(sl_flags != 0);
   if( ci_cas32_succeed(&trs->trusted_lock, l, OO_TRUSTED_LOCK_LOCKED) &&
       ef_eplock_trylock_and_set_flags(&trs->netif.state->lock, sl_flags) ) {
@@ -1085,8 +1072,6 @@ static int allocate_pd(ci_netif* ni, struct vi_allocate_info* info,
 
   switch( NI_OPTS(ni).packet_buffer_mode ) {
   case 0:
-    if( nic->devtype.arch == EFHW_ARCH_EF10 )
-      ni->flags |= CI_NETIF_FLAG_AVOID_ATOMIC_ALLOCATION;
     break;
 
   case CITP_PKTBUF_MODE_VF:
@@ -1453,12 +1438,9 @@ static void initialise_vi(ci_netif* ni, struct ef_vi* vi, struct efrm_vi* vi_rs,
 }
 
 #if CI_CFG_WANT_BPF_NATIVE && CI_HAVE_BPF_NATIVE
-typedef uint32_t ci_xdp_prog_id_t;
-static void tcp_helper_nic_detach_xdp(struct tcp_helper_nic* trs_nic,
-                                      struct efhw_nic* nic);
 static int tcp_helper_nic_attach_xdp(ci_netif* ni,
                                      struct tcp_helper_nic* trs_nic,
-                                     struct efhw_nic* nic);
+                                     cp_xdp_prog_id_t xdp_prog_id);
 #endif
 
 static int allocate_vis(tcp_helper_resource_t* trs,
@@ -1536,6 +1518,7 @@ static int allocate_vis(tcp_helper_resource_t* trs,
     struct efrm_vi_mappings* vm = (void*) ni->vi_data;
     unsigned vi_out_flags = 0;
     struct pci_dev* dev;
+    cp_xdp_prog_id_t xdp_prog_id = 0;
 
     BUILD_BUG_ON(sizeof(ni->vi_data) < sizeof(struct efrm_vi_mappings));
 
@@ -1543,7 +1526,8 @@ static int allocate_vis(tcp_helper_resource_t* trs,
 
     /* Get interface properties. */
     rc = oo_cp_get_hwport_properties(ni->cplane, ns->intf_i_to_hwport[intf_i],
-                                     &alloc_info.hwport_flags, NULL);
+                                     &alloc_info.hwport_flags, NULL,
+                                     &xdp_prog_id);
     if( rc < 0 )
       goto error_out;
 
@@ -1723,7 +1707,7 @@ static int allocate_vis(tcp_helper_resource_t* trs,
 #if CI_CFG_WANT_BPF_NATIVE && CI_HAVE_BPF_NATIVE
     trs_nic->thn_xdp_prog = NULL;
     if( NI_OPTS(ni).xdp_mode == EF_XDP_MODE_COMPATIBLE )
-      rc = tcp_helper_nic_attach_xdp(ni, trs_nic, nic);
+      rc = tcp_helper_nic_attach_xdp(ni, trs_nic, xdp_prog_id);
 #endif
 
     if( alloc_info.release_pd )
@@ -1835,7 +1819,7 @@ static void release_vi(tcp_helper_resource_t* trs)
 #endif
 #if CI_CFG_WANT_BPF_NATIVE && CI_HAVE_BPF_NATIVE
     if( trs_nic->thn_xdp_prog )
-      tcp_helper_nic_detach_xdp(trs_nic, nic);
+      tcp_helper_nic_attach_xdp(&trs->netif, trs_nic, 0);
 #endif
     efrm_vi_resource_release_flushed(trs->nic[intf_i].thn_vi_rs);
     trs->nic[intf_i].thn_vi_rs = NULL;
@@ -2092,7 +2076,7 @@ allocate_netif_resources(ci_resource_onload_alloc_t* alloc,
 
   /* [pages_buf] backs the shared stack state and the socket buffers.  First,
    * count the pages required for the latter. */
-  i = (NI_OPTS(ni).max_ep_bufs + EP_BUF_PER_PAGE - 1) / EP_BUF_PER_PAGE;
+  i = NI_OPTS(ni).max_ep_bufs / EP_BUF_PER_PAGE;
   /* Now add in the pages for the shared state. */
   i += sz / CI_PAGE_SIZE;
 
@@ -3571,6 +3555,33 @@ tcp_helper_alloc_ephem_table(ci_uint32 min_entries, ci_uint32* entries_out)
 }
 
 
+#ifdef OO_USE_NSPROXY
+static void (*my_free_nsproxy)(struct nsproxy *ns);
+#elif defined(EFRM_DO_NAMESPACES) && defined(ERFM_HAVE_NEW_KALLSYMS)
+#include <linux/ipc_namespace.h>
+/* put_ipc_ns() is not exported */
+static void (*my_put_ipc_ns)(struct ipc_namespace *ns);
+#endif
+static void put_namespaces(tcp_helper_resource_t* rs)
+{
+#ifdef EFRM_DO_USER_NS
+  put_user_ns(rs->user_ns);
+#endif
+#ifdef EFRM_DO_NAMESPACES
+#ifdef OO_USE_NSPROXY
+  if( atomic_dec_and_test(&rs->nsproxy->count) )
+    my_free_nsproxy(rs->nsproxy);
+#else
+#ifdef OO_HAS_IPC_NS
+  if( my_put_ipc_ns != NULL )
+    my_put_ipc_ns(rs->ipc_ns);
+#endif
+  put_pid_ns(rs->pid_ns);
+  put_net(rs->net_ns);
+#endif /* OO_USE_NSPROXY */
+#endif /* EFRM_DO_NAMESPACES */
+}
+
 int tcp_helper_rm_alloc(ci_resource_onload_alloc_t* alloc,
                         const ci_netif_config_opts* opts,
                         int ifindices_len, tcp_helper_cluster_t* thc,
@@ -3582,6 +3593,7 @@ int tcp_helper_rm_alloc(ci_resource_onload_alloc_t* alloc,
   int rc, intf_i;
   ci_netif* ni;
   int hw_resources_allocated = 0;
+  struct nsproxy* nsproxy;
 
   ci_assert(alloc);
   ci_assert(rs_out);
@@ -3590,11 +3602,10 @@ int tcp_helper_rm_alloc(ci_resource_onload_alloc_t* alloc,
   alloc->in_name[CI_CFG_STACK_NAME_LEN] = '\0';
 
   if( (opts->packet_buffer_mode & CITP_PKTBUF_MODE_PHYS) &&
-      (phys_mode_gid == -2 ||
-       (phys_mode_gid != -1 && ci_getgid() != phys_mode_gid)) ) {
+      !ci_in_egroup(phys_mode_gid) ) {
     OO_DEBUG_ERR(ci_log("%s: ERROR: EF_PACKET_BUFFER_MODE=%d not permitted "
-                        "(phys_mode_gid=%d gid=%d pid=%d)", __FUNCTION__,
-                        opts->packet_buffer_mode, phys_mode_gid, ci_getgid(),
+                        "(phys_mode_gid=%d egid=%d pid=%d)", __FUNCTION__,
+                        opts->packet_buffer_mode, phys_mode_gid, ci_getegid(),
                         current->tgid);
                  ci_log("%s: HINT: See the phys_mode_gid onload module "
                         "option.", __FUNCTION__));
@@ -3666,7 +3677,6 @@ int tcp_helper_rm_alloc(ci_resource_onload_alloc_t* alloc,
   rs->k_ref_count = 1;          /* 1 reference for userland */
   rs->n_ep_closing_refs = 0;
   rs->intfs_to_reset = 0;
-  rs->intfs_to_xdp_update = 0;
   rs->intfs_suspended = 0;
   rs->thc = NULL;
   atomic_set(&rs->timer_running, 0);
@@ -3691,13 +3701,25 @@ int tcp_helper_rm_alloc(ci_resource_onload_alloc_t* alloc,
   init_completion(&rs->complete);
 
 #ifdef EFRM_DO_NAMESPACES
-  /* Initialise nsproxy field */
-  rs->nsproxy = task_nsproxy_start(current);
-  ci_assert(rs->nsproxy);
+  /* Initialise namespaces */
+  nsproxy = task_nsproxy_start(current);
+  ci_assert(nsproxy);
+#ifdef OO_USE_NSPROXY
+  rs->nsproxy = nsproxy;
   get_nsproxy(rs->nsproxy);
   netns_get_identifiers(rs->netif.state, rs->nsproxy->net_ns);
   task_nsproxy_done(current);
+#else
+  rs->net_ns = get_net(nsproxy->net_ns);
+  rs->pid_ns = get_pid_ns(ci_get_pid_ns(nsproxy));
+#ifdef OO_HAS_IPC_NS
+  if( my_put_ipc_ns != NULL )
+    rs->ipc_ns = get_ipc_ns(nsproxy->ipc_ns);
 #endif
+  task_nsproxy_done(current);
+  netns_get_identifiers(rs->netif.state, rs->net_ns);
+#endif /* OO_USE_NSPROXY */
+#endif /* EFRM_DO_NAMESPACES */
 
 #ifdef EFRM_DO_USER_NS
   rs->user_ns = current_user_ns();
@@ -3783,8 +3805,7 @@ int tcp_helper_rm_alloc(ci_resource_onload_alloc_t* alloc,
   rc = allocate_netif_hw_resources(alloc, thc, rs);
   if( rc < 0 ) goto fail6;
 
-  if( inject_kernel_gid != -2 && 
-      ( inject_kernel_gid == -1 || inject_kernel_gid == ci_getgid() ) ) {
+  if( ci_in_egroup(inject_kernel_gid) ) {
     ni->flags |= CI_NETIF_FLAG_MAY_INJECT_TO_KERNEL;
     ni->state->flags |= CI_NETIF_FLAG_DO_INJECT_TO_KERNEL;
   }
@@ -4016,12 +4037,7 @@ int tcp_helper_rm_alloc(ci_resource_onload_alloc_t* alloc,
  fail5a:
   destroy_workqueue(rs->wq);
  fail5:
-#ifdef EFRM_DO_USER_NS
-  put_user_ns(rs->user_ns);
-#endif
-#ifdef EFRM_DO_NAMESPACES
-  put_nsproxy(rs->nsproxy);
-#endif
+  put_namespaces(rs);
   release_netif_resources(rs);
  fail4:
   ci_id_pool_free(&THR_TABLE.instances, rs->id, &THR_TABLE.lock);
@@ -4405,52 +4421,13 @@ void tcp_helper_reset_stack(ci_netif* ni, int intf_i)
 }
 
 #if CI_CFG_WANT_BPF_NATIVE && CI_HAVE_BPF_NATIVE
-/* This callback from efrm occurs with a spinlock held, so we cannot handle
- * the change directly here, but must defer it.  The actual update is handled
- * by tcp_helper_handle_xdp_change().
- */
-void tcp_helper_xdp_change(ci_netif *ni, int intf_i)
+void tcp_helper_handle_xdp_change(tcp_helper_resource_t *thr, int intf_i,
+                                  cp_xdp_prog_id_t xdp_prog_id)
 {
-  tcp_helper_resource_t *thr = CI_CONTAINER(tcp_helper_resource_t, netif, ni);
-  ci_irqlock_state_t lock_flags;
+  struct tcp_helper_nic* trs_nic = &thr->nic[intf_i];
 
-  /* Remember which interface needs the update */
-  ci_irqlock_lock(&thr->lock, &lock_flags);
-  thr->intfs_to_xdp_update |= (1 << intf_i);
-  ci_irqlock_unlock(&thr->lock, &lock_flags);
-
-  if( efab_tcp_helper_netif_lock_or_set_flags(thr, OO_TRUSTED_LOCK_XDP_CHANGE,
-                                              CI_EPLOCK_NETIF_XDP_CHANGE,
-                                              1) ) {
-    ef_eplock_holder_set_flag(&ni->state->lock, CI_EPLOCK_NETIF_XDP_CHANGE);
-    efab_tcp_helper_netif_unlock(thr, 1);
-  }
-}
-
-void tcp_helper_handle_xdp_change(tcp_helper_resource_t *thr)
-{
-  int intf_i;
-  unsigned intfs_to_update;
-  ci_irqlock_state_t lock_flags;
-
-  ci_irqlock_lock(&thr->lock, &lock_flags);
-  intfs_to_update = thr->intfs_to_xdp_update;
-  thr->intfs_to_xdp_update = 0;
-  ci_irqlock_unlock(&thr->lock, &lock_flags);
-
-  for( intf_i = 0; intf_i < CI_CFG_MAX_INTERFACES; ++intf_i ) {
-    if( intfs_to_update & (1 << intf_i) ) {
-      struct tcp_helper_nic* trs_nic = &thr->nic[intf_i];
-      struct efhw_nic* nic =
-        efrm_client_get_nic(trs_nic->thn_oo_nic->efrm_client);
-
-      if( NI_OPTS(&thr->netif).xdp_mode == EF_XDP_MODE_COMPATIBLE ) {
-        if( trs_nic->thn_xdp_prog )
-          tcp_helper_nic_detach_xdp(trs_nic, nic);
-        tcp_helper_nic_attach_xdp(&thr->netif, trs_nic, nic);
-      }
-    }
-  }
+  if( NI_OPTS(&thr->netif).xdp_mode == EF_XDP_MODE_COMPATIBLE )
+    tcp_helper_nic_attach_xdp(&thr->netif, trs_nic, xdp_prog_id);
 }
 #endif
 
@@ -5213,12 +5190,7 @@ void tcp_helper_dtor(tcp_helper_resource_t* trs)
   if( trs->netif.cplane_init_net != NULL )
     cp_release(trs->netif.cplane_init_net);
   cp_release(trs->netif.cplane);
-#ifdef EFRM_DO_NAMESPACES
-  put_nsproxy(trs->nsproxy);
-#endif
-#ifdef EFRM_DO_USER_NS
-  put_user_ns(trs->user_ns);
-#endif
+  put_namespaces(trs);
 
 #ifdef ONLOAD_OFE
   if( trs->netif.ofe != NULL )
@@ -5288,12 +5260,16 @@ efab_tcp_driver_ctor()
 {
   int rc = 0;
 
-#ifdef EFRM_DO_NAMESPACES
+#ifdef OO_USE_NSPROXY
   my_free_nsproxy = efrm_find_ksym("free_nsproxy");
   if( my_free_nsproxy == NULL ) {
     ci_log("Failed to find free_nsproxy() function in the running kernel.");
     return -EINVAL;
   }
+#elif defined(EFRM_DO_NAMESPACES) && defined(OO_HAS_IPC_NS)
+  my_put_ipc_ns = efrm_find_ksym("put_ipc_ns");
+  if( my_put_ipc_ns == NULL )
+    ci_log("Failed to find put_ipc_ns(), proceeding without.");
 #endif
 
   CI_ZERO(&efab_tcp_driver);
@@ -5496,7 +5472,11 @@ int efab_tcp_helper_more_socks(tcp_helper_resource_t* trs)
   if( ni->ep_tbl_n >= ni->ep_tbl_max )  return -ENOSPC;
 
   page_i = oo_sockid_to_state_off(ni, ni->ep_tbl_n) >> CI_PAGE_SHIFT;
-  rc = ci_shmbuf_demand_page(&ni->pages_buf, page_i, &THR_TABLE.lock);
+  rc = ci_shmbuf_demand_page(&ni->pages_buf, page_i
+#ifndef EFRM_HAVE_ALLOC_VM_AREA_WITH_PTES
+                             , &THR_TABLE.lock
+#endif
+                             );
   if( rc < 0 ) {
     OO_DEBUG_ERR(ci_log("%s: demand failed (%d)", __FUNCTION__, rc));
     return rc;
@@ -5612,7 +5592,14 @@ efab_tcp_helper_iobufset_alloc(tcp_helper_resource_t* trs,
     /* Use huge pages if we are in the same namespace only.
      * ipc_ns has a pointer to user_ns, so we may compare uids
      * if ipc namespaces match. */
-    if( ns != NULL && ns->ipc_ns == trs->nsproxy->ipc_ns
+    if( ns != NULL
+#ifdef OO_USE_NSPROXY
+        && ns->ipc_ns == trs->nsproxy->ipc_ns
+#elif defined(OO_HAS_IPC_NS)
+        && (ns->ipc_ns == trs->ipc_ns || my_put_ipc_ns == NULL)
+#elif defined(EFRM_DO_USER_NS)
+        && current_user_ns() == trs->user_ns
+#endif
         && ci_geteuid() == ni->keuid ) {
       flags |= NI_OPTS(ni).huge_pages;
     }
@@ -5689,17 +5676,14 @@ efab_tcp_helper_more_bufs(tcp_helper_resource_t* trs)
   if( ni->pkt_sets_n == ni->pkt_sets_max )
     return -ENOSPC;
 
-  if( (ni->flags & (CI_NETIF_FLAG_IN_DL_CONTEXT |
-                    CI_NETIF_FLAG_AVOID_ATOMIC_ALLOCATION) ) ==
-       (CI_NETIF_FLAG_IN_DL_CONTEXT |
-        CI_NETIF_FLAG_AVOID_ATOMIC_ALLOCATION) ) {
+  if( ni->flags & CI_NETIF_FLAG_IN_DL_CONTEXT ) {
     ef_eplock_holder_set_flag(&ni->state->lock,
                               CI_EPLOCK_NETIF_NEED_PKT_SET);
     return -EBUSY;
   }
 
-  hw_addrs = ci_alloc(sizeof(uint64_t) * (1 << HW_PAGES_PER_SET_S) *
-                      CI_CFG_MAX_INTERFACES);
+  hw_addrs = ci_vmalloc(sizeof(uint64_t) * (1 << HW_PAGES_PER_SET_S) *
+                        CI_CFG_MAX_INTERFACES);
   if( hw_addrs == NULL ) {
     ci_log("%s: [%d] out of memory", __func__, trs->id);
     return -ENOMEM;
@@ -5720,23 +5704,8 @@ efab_tcp_helper_more_bufs(tcp_helper_resource_t* trs)
       NI_LOG(ni, RESOURCE_WARNINGS,
              FN_FMT "Failed to allocate packet buffers (%d)",
              FN_PRI_ARGS(&trs->netif), rc);
-
-      /* We've got ENOMEM.  If we are in atomic context, it is possible
-       * that memory is available in non-atomic mode.
-       * efab_tcp_helper_netif_lock_callback() will kick off packet
-       * allocation via workqueue without
-       * CI_NETIF_FLAG_AVOID_ATOMIC_ALLOCATION flag check, so we'll
-       * retry from non-atomic context immediately.
-       *
-       * For all other errors (ENOMEM & non-atomic or other rc values),
-       * there is no obvious benefit in re-trying the same operation
-       * immediately. */
-      if( rc == -ENOMEM && ni->flags & CI_NETIF_FLAG_IN_DL_CONTEXT ) {
-        ef_eplock_holder_set_flag(&ni->state->lock,
-                                  CI_EPLOCK_NETIF_NEED_PKT_SET);
-      }
     }
-    ci_free(hw_addrs);
+    ci_vfree(hw_addrs);
     return rc;
   }
   /* check we get the size we are expecting */
@@ -5753,7 +5722,7 @@ efab_tcp_helper_more_bufs(tcp_helper_resource_t* trs)
     OO_STACK_FOR_EACH_INTF_I(ni, intf_i)
       oo_iobufset_resource_release(iobrs[intf_i], 0);
     oo_iobufset_pages_release(pages);
-    ci_free(hw_addrs);
+    ci_vfree(hw_addrs);
     return -ENOSPC;
   }
   bufset_id = ni->pkt_sets_n;
@@ -5814,7 +5783,7 @@ efab_tcp_helper_more_bufs(tcp_helper_resource_t* trs)
     pkt->next = ni->packets->set[bufset_id].free;
     ni->packets->set[bufset_id].free = OO_PKT_P(pkt);
   }
-  ci_free(hw_addrs);
+  ci_vfree(hw_addrs);
 
   trs->netif.state->packet_alloc_numa_nodes |= 1 << numa_node_id();
   CHECK_FREEPKTS(ni);
@@ -6312,7 +6281,7 @@ linux_set_periodic_timer_restart(tcp_helper_resource_t* rs,
   if( timeout < periodic_poll_skew )
     timeout = periodic_poll_skew;
   if( timeout >= periodic_poll )
-    timeout = periodic_poll + ci_net_random() % periodic_poll_skew;
+    timeout = periodic_poll + get_random_long() % periodic_poll_skew;
 
   thr_queue_delayed_work(rs, &rs->timer, timeout);
 }
@@ -6975,7 +6944,7 @@ ci_inline int want_proactive_packet_allocation(ci_netif* ni)
  *
  *--------------------------------------------------------------------*/
 
-unsigned
+ci_uint64
 efab_tcp_helper_netif_lock_callback(eplock_helper_t* epl, ci_uint64 lock_val,
                                     int in_dl_context)
 {
@@ -7054,24 +7023,6 @@ efab_tcp_helper_netif_lock_callback(eplock_helper_t* epl, ci_uint64 lock_val,
       efab_tcp_helper_more_bufs(thr);
       flags_set &=~ CI_EPLOCK_NETIF_NEED_PKT_SET;
     }
-
-#if CI_CFG_WANT_BPF_NATIVE && CI_HAVE_BPF_NATIVE
-    if( flags_set & CI_EPLOCK_NETIF_XDP_CHANGE ) {
-      if( in_dl_context ) {
-        OO_DEBUG_TCPH(ci_log("%s: [%u] defer XDP change handling to workitem",
-                             __FUNCTION__, thr->id));
-        ef_eplock_holder_set_flags(&ni->state->lock,
-                                   after_unlock_flags | flags_set);
-        tcp_helper_defer_dl2work(thr, OO_THR_AFLAG_UNLOCK_UNTRUSTED);
-        return 0;
-      }
-      OO_DEBUG_TCPH(ci_log("%s: [%u] handling XDP change now",
-                           __FUNCTION__, thr->id));
-      tcp_helper_handle_xdp_change(thr);
-      CITP_STATS_NETIF(++ni->state->stats.unlock_slow_xdp_change);
-      flags_set &=~ CI_EPLOCK_NETIF_XDP_CHANGE;
-    }
-#endif
 
     if( flags_set & CI_EPLOCK_NETIF_PURGE_TXQS ) {
       tcp_helper_purge_txq_locked(thr);
@@ -7530,7 +7481,7 @@ static void oo_inject_packets_kernel(tcp_helper_resource_t* trs, int sync)
 #include <uapi/linux/bpf.h>
 #include <linux/bpf.h>
 
-static int ci_bpf_prog_get_fd_by_id(ci_xdp_prog_id_t id)
+static int ci_bpf_prog_get_fd_by_id(cp_xdp_prog_id_t id)
 {
   int rc;
   mm_segment_t old_fs;
@@ -7576,7 +7527,7 @@ static void ci_bpf_prog_put(struct bpf_prog* prog)
 }
 
 
-static int ci_bpf_prog_get_by_id(ci_xdp_prog_id_t id, struct bpf_prog** prog_out)
+static int ci_bpf_prog_get_by_id(cp_xdp_prog_id_t id, struct bpf_prog** prog_out)
 {
   int fd = ci_bpf_prog_get_fd_by_id(id);
   struct bpf_prog* prog;
@@ -7595,72 +7546,45 @@ static int ci_bpf_prog_get_by_id(ci_xdp_prog_id_t id, struct bpf_prog** prog_out
   return 0;
 }
 
-static void tcp_helper_nic_detach_xdp(struct tcp_helper_nic* trs_nic,
-                                      struct efhw_nic* nic)
-{
-  ci_bpf_prog_put(trs_nic->thn_xdp_prog);
-  trs_nic->thn_xdp_prog = NULL;
-}
-
 static int tcp_helper_nic_attach_xdp(ci_netif* ni,
                                      struct tcp_helper_nic* trs_nic,
-                                     struct efhw_nic* nic)
+                                     cp_xdp_prog_id_t xdp_prog_id)
 {
-  struct net_device* netdev = efhw_nic_get_net_dev(nic);
-  struct netdev_bpf xdp = {};
-  ci_xdp_prog_id_t xdp_prog_id = 0;
   int rc = 0;
-
-  /* Caller is responsible for ensuring that any previously attached prog
-   * has been safely detached.
-   */
-  ci_assert_equal(trs_nic->thn_xdp_prog, NULL);
-
-  /* XDP prog is protected by netif lock, which is also needed to assert on
-   * CI_NETIF_FLAG_IN_DL_CONTEXT flag.
-   */
-  ci_assert( ci_netif_is_locked(ni) );
-
-  /* We need to take the rtnl lock to query the attached prog, so we better
-   * not be in dl context, where we may already hold the lock.
-   */
-  ci_assert_nflags(ni->flags, CI_NETIF_FLAG_IN_DL_CONTEXT);
-
-  xdp.command = XDP_QUERY_PROG;
-  if( netdev ) {
-    if( netdev->netdev_ops->ndo_bpf ) {
-      rtnl_lock();
-      rc = netdev->netdev_ops->ndo_bpf(netdev, &xdp);
-      rtnl_unlock();
-      if( rc == 0 )
-        xdp_prog_id = xdp.prog_id;
-    }
-    dev_put(netdev);
-  }
+  ci_irqlock_state_t lock_flags;
+  struct bpf_prog* prog = NULL;
+  struct bpf_prog* old_prog = NULL;
 
   if( xdp_prog_id != 0 ) {
-    struct bpf_prog* prog = NULL;
     rc = ci_bpf_prog_get_by_id(xdp_prog_id, &prog);
     if( rc ) {
       NI_LOG(ni, RESOURCE_WARNINGS,
              FN_FMT "Failed obtain xdp program %d (%d)",
              FN_PRI_ARGS(ni), xdp_prog_id, rc);
     }
-    trs_nic->thn_xdp_prog = prog;
   }
+
+  ci_irqlock_lock(&netif2tcp_helper_resource(ni)->lock, &lock_flags);
+  old_prog = trs_nic->thn_xdp_prog;
+  trs_nic->thn_xdp_prog = prog;
+  ci_irqlock_unlock(&netif2tcp_helper_resource(ni)->lock, &lock_flags);
+  if( old_prog != NULL )
+    ci_bpf_prog_put(old_prog);
 
   return rc;
 }
 
-ci_inline int oo_xdp_rx_pkt_locked(ci_netif* ni,
+ci_inline int oo_xdp_rx_pkt_locked(tcp_helper_resource_t* trs,
                                    struct net_device* dev,
-                                   struct bpf_prog* xdp_prog,
+                                   int intf_i,
                                    ci_ip_pkt_fmt* pkt)
 {
   /* TODO: ensure that packet:
    *  * is linear
    *  * has enough headroom (256 bytes)
    *  see netif_receive_generic_xdp in kernel */
+  struct tcp_helper_nic* trs_nic = &trs->nic[intf_i];
+  struct bpf_prog* xdp_prog = rcu_dereference(trs_nic->thn_xdp_prog);
   struct xdp_buff _xdp;
   struct xdp_buff* xdp = &_xdp;
   void *orig_data, *orig_data_end;
@@ -7668,6 +7592,9 @@ ci_inline int oo_xdp_rx_pkt_locked(ci_netif* ni,
     .dev = dev,
   };
   int act;
+
+  if( xdp_prog == NULL )
+    return XDP_PASS;
 
   /* The XDP program wants to see the packet starting at the MAC
    * header.
@@ -7700,15 +7627,14 @@ ci_inline int oo_xdp_rx_pkt_locked(ci_netif* ni,
 /* bool */ int
 efab_tcp_helper_xdp_rx_pkt(tcp_helper_resource_t* trs, int intf_i, ci_ip_pkt_fmt* pkt)
 {
-  struct bpf_prog* xdp_prog;
   int ret = XDP_PASS;
   struct tcp_helper_nic* trs_nic = &trs->nic[intf_i];
   struct efhw_nic* nic;
   struct net_device* dev;
   ci_netif* ni = &trs->netif;
 
-  xdp_prog = trs_nic->thn_xdp_prog;
-  if( xdp_prog == NULL )
+  /* Early exit if nothing to do.  We'll re-read it after RCU lock later. */
+  if( trs_nic->thn_xdp_prog == NULL )
     return 1;
 
   nic = efrm_client_get_nic(trs_nic->thn_oo_nic->efrm_client);
@@ -7725,7 +7651,7 @@ efab_tcp_helper_xdp_rx_pkt(tcp_helper_resource_t* trs, int intf_i, ci_ip_pkt_fmt
    * seperately for each pkt */
   preempt_disable();
   rcu_read_lock();
-  ret = oo_xdp_rx_pkt_locked(ni, dev, xdp_prog, pkt);
+  ret = oo_xdp_rx_pkt_locked(trs, dev, intf_i, pkt);
   rcu_read_unlock();
   preempt_enable();
 

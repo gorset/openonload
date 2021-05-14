@@ -329,7 +329,7 @@ efab_tcp_helper_detach_file(tcp_helper_endpoint_t* ep,
   ci_assert_nflags(wo->waitable.sb_aflags, CI_SB_AFLAG_ORPHAN);
 
 #ifdef EFRM_DO_NAMESPACES
-  ci_assert_nequal(pid, task_pid_nr_ns(current, ci_netif_get_pidns(&trs->netif)));
+  ci_assert_nequal(pid, task_pid_nr_ns(current, thr_pid_ns(trs)));
 #endif
   ci_assert_ge(fd, 0);
 
@@ -1533,6 +1533,49 @@ static int oo_cp_init_kernel_mibs_rsop(ci_private_t *priv, void *arg)
   return rc;
 }
 
+static int oo_cp_xdp_prog_change(ci_private_t *priv, void *arg)
+{
+#if CI_CFG_WANT_BPF_NATIVE && CI_HAVE_BPF_NATIVE
+  ci_hwport_id_t hwport = *(ci_hwport_id_t*)arg;
+  struct oo_cplane_handle* cp;
+  cp_xdp_prog_id_t xdp_prog_id;
+  ci_irqlock_state_t lock_flags;
+  ci_dllink *link;
+  int intf_i;
+  ci_netif* ni;
+
+  int rc = cp_acquire_from_priv_if_server(priv, &cp);
+  if( rc != 0 )
+    return rc;
+
+  rc = oo_cp_get_hwport_properties(cp, hwport, NULL, NULL, &xdp_prog_id);
+  cp_release(cp);
+  if( rc < 0 )
+    return rc;
+
+  /* Similar to oo_efrm_callback_hook_generic() */
+  ci_irqlock_lock(&THR_TABLE.lock, &lock_flags);
+  CI_DLLIST_FOR_EACH(link, &THR_TABLE.started_stacks) {
+    tcp_helper_resource_t *thr;
+
+    thr = CI_CONTAINER(tcp_helper_resource_t, all_stacks_link, link);
+    ni = &thr->netif;
+    if( (intf_i = ni->hwport_to_intf_i[hwport]) >= 0 )
+      tcp_helper_handle_xdp_change(thr, intf_i, xdp_prog_id);
+  }
+  ci_irqlock_unlock(&THR_TABLE.lock, &lock_flags);
+
+  ni = NULL;
+  while( iterate_netifs_unlocked(&ni, 0, 0) == 0 ) {
+    if( (intf_i = ni->hwport_to_intf_i[hwport]) >= 0 )
+      tcp_helper_handle_xdp_change(netif2tcp_helper_resource(ni),
+                                   intf_i, xdp_prog_id);
+  }
+
+#endif
+  return 0;
+}
+
 
 /*************************************************************************
  * ATTENTION! ACHTUNG! ATENCION!                                         *
@@ -1570,6 +1613,7 @@ oo_operations_table_t oo_operations[] = {
   op(OO_IOC_CP_CHECK_VETH_ACCELERATION, oo_cp_check_veth_acceleration_rsop),
   op(OO_IOC_CP_SELECT_INSTANCE, oo_cp_select_instance_rsop),
   op(OO_IOC_CP_INIT_KERNEL_MIBS, oo_cp_init_kernel_mibs_rsop),
+  op(OO_IOC_CP_XDP_PROG_CHANGE, oo_cp_xdp_prog_change),
 
   /* include/onload/ioctl.h: */
   op(OO_IOC_DBG_GET_STACK_INFO, efab_tcp_helper_get_info),

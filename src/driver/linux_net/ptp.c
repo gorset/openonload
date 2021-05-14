@@ -45,6 +45,7 @@
 #include <linux/pps_kernel.h>
 #include <linux/ptp_clock_kernel.h>
 #endif
+#include <linux/sysfs.h>
 #include "net_driver.h"
 #include "efx.h"
 #include "mcdi.h"
@@ -290,6 +291,7 @@ struct efx_pps_data {
 	int major;
 	int last_ev;
 	int last_ev_taken;
+	struct pps_device *device;
 };
 
 /**
@@ -304,11 +306,23 @@ struct efx_pps_dev_attr {
 	u8 pos;
 	ssize_t (*show)(struct efx_pps_data *, u8 pos, char *);
 };
+
+static struct pps_source_info efx_pps_info = {
+        .name         = "sfc",
+        .path         = "",
+        .mode         = PPS_CAPTUREASSERT | PPS_OFFSETASSERT | PPS_CANWAIT |
+                        PPS_TSFMT_TSPEC,
+        .echo         = NULL,
+        .owner        = THIS_MODULE,
+};
 #endif
 
 /**
  * struct efx_ptp_data - Precision Time Protocol (PTP) state
  * @efx: The NIC context
+ * @ifindex: Interface index of PHC
+ * @adapter_base_addr: MAC address of port0 (used as unique identifier) of PHC
+ * @node_ptp_all_phcs: Node in list of all PHC PTP datas
  * @channel: The PTP channel (Siena only)
  * @rx_ts_inline: Flag for whether RX timestamps are inline (else they are
  *	separate events)
@@ -371,7 +385,7 @@ struct efx_pps_dev_attr {
  * @phc_clock_info: Registration structure for phc device
  * @pps_work: pps work task for handling pps events
  * @pps_workwq: pps work queue
- * @nic_ts_enabled: Flag indicating if NIC generated TS events are handled
+ * @usr_evt_enabled: Flag indicating how NIC generated TS events are handled
  * @txbuf: Buffer for use when transmitting (PTP) packets to MC (avoids
  *         allocations in main data path).
  * @good_syncs: Number of successful synchronisations.
@@ -388,6 +402,9 @@ struct efx_pps_dev_attr {
  */
 struct efx_ptp_data {
 	struct efx_nic *efx;
+	int ifindex;
+	u8 adapter_base_addr[ETH_ALEN];
+	struct list_head node_ptp_all_phcs;
 	struct efx_channel *channel;
 	bool rx_ts_inline;
 	struct sk_buff_head rxq;
@@ -468,7 +485,10 @@ struct efx_ptp_data {
 	struct efx_pps_data *pps_data;
 #endif
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT)
-	bool nic_ts_enabled;
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PTP_PF_NONE)
+	struct ptp_pin_desc pin_config[1];
+#endif
+	u8 usr_evt_enabled;
 #endif
 	_MCDI_DECLARE_BUF(txbuf, MC_CMD_PTP_IN_TRANSMIT_LENMAX);
 
@@ -529,8 +549,6 @@ static int efx_phc_gettime(struct ptp_clock_info *ptp, struct timespec64 *ts);
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT)
 static int efx_phc_settime(struct ptp_clock_info *ptp,
 			   const struct timespec64 *e_ts);
-static int efx_phc_enable(struct ptp_clock_info *ptp,
-			  struct ptp_clock_request *request, int on);
 
 #if defined(EFX_USE_KCOMPAT) && !defined(EFX_USE_64BIT_PHC)
 static int efx_phc_gettime32(struct ptp_clock_info *ptp, struct timespec *ts);
@@ -539,8 +557,8 @@ static int efx_phc_settime32(struct ptp_clock_info *ptp,
 #endif
 #endif
 
-static LIST_HEAD(efx_all_funcs_list);
-static DEFINE_SPINLOCK(ptp_all_funcs_list_lock);
+static LIST_HEAD(efx_all_phcs_list);
+static DEFINE_SPINLOCK(ptp_all_phcs_list_lock);
 
 bool efx_ptp_use_mac_tx_timestamps(struct efx_nic *efx)
 {
@@ -701,6 +719,18 @@ size_t efx_ptp_update_stats(struct efx_nic *efx, u64 *stats)
 	return PTP_STAT_COUNT;
 }
 
+
+static void efx_ptp_delete_data(struct kref *kref)
+{
+	struct efx_ptp_data *ptp = container_of(kref, struct efx_ptp_data,
+						kref);
+
+#if defined(EFX_NOT_UPSTREAM) && defined(CONFIG_SFC_PPS)
+	if (ptp->pps_data)
+		kfree(ptp->pps_data);
+#endif
+	kfree(ptp);
+}
 #if defined(EFX_NOT_UPSTREAM) && defined(CONFIG_SFC_PPS)
 /* Read one MC PTP related statistic.  This actually gathers
  * all PTP statistics, throwing away the others.
@@ -792,30 +822,16 @@ static ssize_t show_max_adjfreq(struct device *dev,
 				 char *buff)
 {
 	struct efx_nic *efx = pci_get_drvdata(to_pci_dev(dev));
-	struct efx_nic *phc_efx = efx->phc_efx;
+	struct efx_ptp_data *ptp = efx->phc_ptp_data;
 	s32 max_adjfreq = 0;
 
-	if (phc_efx && phc_efx->ptp_data)
-	        max_adjfreq = phc_efx->ptp_data->max_adjfreq;
+	if (ptp)
+	        max_adjfreq = ptp->max_adjfreq;
 
 	return sprintf(buff, "%d\n", max_adjfreq);
 }
 
 static DEVICE_ATTR(max_adjfreq, S_IRUGO, show_max_adjfreq, NULL);
-
-static void efx_ptp_delete_data(struct kref *kref)
-{
-	struct efx_ptp_data *ptp = container_of(kref, struct efx_ptp_data,
-						kref);
-	struct efx_nic *efx = ptp->efx;
-
-	if (efx)
-		efx->ptp_data = NULL;
-
-	if (ptp->pps_data)
-		kfree(ptp->pps_data);
-	kfree(ptp);
-}
 
 static void ptp_boardattr_release(struct kobject *kobj)
 {
@@ -1828,7 +1844,25 @@ static void efx_ptp_xmit_skb_queue(struct efx_nic *efx, struct sk_buff *skb)
 
 	tx_queue = efx->select_tx_queue(ptp_data->channel, skb);
 	if (tx_queue && tx_queue->timestamping) {
+
+/*
+ * Some RH RT kernels are shipped with CONFIG_PREEMPT_RT_BASE instead of
+ * CONFIG_PREEMPT_RT
+ */
+#if defined(CONFIG_PREEMPT) || defined(CONFIG_PREEMPT_RT) || defined(CONFIG_PREEMPT_RT_BASE)
+		/*
+		 * Kernels using xmit_more() based on per-cpu data warn if
+		 * preemption is enabled when invoked. Disabling preemption
+		 * here before calling tx driver code which invokes xmit_more.
+		 * This is only needed in kernels with preemption enabled or
+		 * RT kernels.
+		 */
+		preempt_disable();
+#endif
 		efx_enqueue_skb(tx_queue, skb);
+#if defined(CONFIG_PREEMPT) || defined(CONFIG_PREEMPT_RT) || defined(CONFIG_PREEMPT_RT_BASE)
+		preempt_enable();
+#endif
 		/* If netdev_xmit_more() was true in enqueue_skb() then our
 		 * queue will be waiting for the next packet to push the
 		 * doorbell. Since the next packet might not be coming this
@@ -2430,28 +2464,34 @@ static int efx_ptp_restart(struct efx_nic *efx)
 	return 0;
 }
 
+#ifdef CONFIG_SFC_PPS
 static void efx_ptp_pps_worker(struct work_struct *work)
 {
 	struct efx_ptp_data *ptp =
 		container_of(work, struct efx_ptp_data, pps_work);
-	struct efx_nic *efx = ptp->efx;
+	struct efx_nic *efx = (ptp? ptp->efx: NULL);
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT)
 	struct ptp_clock_event ptp_evt;
 #endif
 
-	if (efx_ptp_synchronize(efx, PTP_SYNC_ATTEMPTS))
+	if (!ptp || !efx || !ptp->pps_workwq)
 		return;
+	kref_get(&ptp->kref);
+
+	if (efx_ptp_synchronize(efx, PTP_SYNC_ATTEMPTS))
+		goto out;
 
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT)
-#ifdef EFX_NOT_UPSTREAM
-	if (!ptp->nic_ts_enabled)
-		return;
+	if (ptp->usr_evt_enabled & (1 << PTP_CLK_REQ_PPS)) {
+		ptp_evt.type = PTP_CLOCK_PPSUSR;
+		ptp_evt.pps_times = ptp->host_time_pps;
+		ptp_clock_event(ptp->phc_clock, &ptp_evt);
+	}
 #endif
-	ptp_evt.type = PTP_CLOCK_PPSUSR;
-	ptp_evt.pps_times = ptp->host_time_pps;
-	ptp_clock_event(ptp->phc_clock, &ptp_evt);
-#endif
+out:
+	kref_put(&ptp->kref, efx_ptp_delete_data);
 }
+#endif
 
 #if defined(EFX_NOT_UPSTREAM) && defined(CONFIG_SFC_PPS)
 int efx_ptp_pps_get_event(struct efx_nic *efx, struct efx_ts_get_pps *event)
@@ -2502,7 +2542,23 @@ int efx_ptp_pps_get_event(struct efx_nic *efx, struct efx_ts_get_pps *event)
 	return 0;
 }
 
-int efx_ptp_hw_pps_enable(struct efx_nic *efx, struct efx_ts_hw_pps *data)
+static bool efx_is_pps_possible(struct efx_nic *efx)
+{
+	MCDI_DECLARE_BUF(inbuf, MC_CMD_PTP_IN_PPS_ENABLE_LEN);
+	int rc;
+
+	MCDI_SET_DWORD(inbuf, PTP_IN_OP, MC_CMD_PTP_OP_PPS_ENABLE);
+	MCDI_SET_DWORD(inbuf, PTP_IN_PERIPH_ID, 0);
+	MCDI_SET_DWORD(inbuf, PTP_IN_PPS_ENABLE_OP, MC_CMD_PTP_DISABLE_PPS);
+	MCDI_SET_DWORD(inbuf, PTP_IN_PPS_ENABLE_QUEUE_ID, 0);
+
+	rc = efx_mcdi_rpc_quiet(efx, MC_CMD_PTP, inbuf, sizeof(inbuf),
+			  NULL, 0, NULL);
+
+	return rc != -EPERM;
+}
+
+int efx_ptp_hw_pps_enable(struct efx_nic *efx, bool enable)
 {
 	struct efx_pps_data *pps_data;
 	MCDI_DECLARE_BUF(inbuf, MC_CMD_PTP_IN_PPS_ENABLE_LEN);
@@ -2514,17 +2570,13 @@ int efx_ptp_hw_pps_enable(struct efx_nic *efx, struct efx_ts_hw_pps *data)
 	if (!efx->ptp_data->pps_data)
 		return -ENOTTY;
 
-	if (!data) {
-		return -EINVAL;
-	}
-
 	pps_data = efx->ptp_data->pps_data;
 
 	MCDI_SET_DWORD(inbuf, PTP_IN_OP, MC_CMD_PTP_OP_PPS_ENABLE);
 	MCDI_SET_DWORD(inbuf, PTP_IN_PERIPH_ID, 0);
 	MCDI_SET_DWORD(inbuf, PTP_IN_PPS_ENABLE_OP,
-		       data->enable ? MC_CMD_PTP_ENABLE_PPS :
-				      MC_CMD_PTP_DISABLE_PPS);
+		       enable ? MC_CMD_PTP_ENABLE_PPS :
+				MC_CMD_PTP_DISABLE_PPS);
 	MCDI_SET_DWORD(inbuf, PTP_IN_PPS_ENABLE_QUEUE_ID,
 		       efx->ptp_data->channel ?
 		       efx->ptp_data->channel->channel : 0);
@@ -2532,10 +2584,10 @@ int efx_ptp_hw_pps_enable(struct efx_nic *efx, struct efx_ts_hw_pps *data)
 	rc = efx_mcdi_rpc(efx, MC_CMD_PTP, inbuf, sizeof(inbuf),
 			  NULL, 0, NULL);
 
-	if (rc)
+	if (rc && rc != -MC_CMD_ERR_EALREADY)
 		return rc;
 
-	if (data->enable) {
+	if (enable) {
 		pps_data->last_ev = 0;
 		pps_data->last_ev_taken = 0;
 		memset(&pps_data->s_delta, 0x0, sizeof(pps_data->s_delta));
@@ -2543,7 +2595,7 @@ int efx_ptp_hw_pps_enable(struct efx_nic *efx, struct efx_ts_hw_pps *data)
 		memset(&pps_data->n_assert, 0x0, sizeof(pps_data->n_assert));
 	}
 
-	pps_data->nic_hw_pps_enabled = data->enable;
+	pps_data->nic_hw_pps_enabled = enable;
 
 	return 0;
 }
@@ -2586,10 +2638,16 @@ static ssize_t siena_show_ptp(struct device *dev,
 static DEVICE_ATTR(ptp_caps, S_IRUGO, siena_show_ptp, NULL);
 #endif
 
+static inline bool efx_phc_exposed(struct efx_nic *efx)
+{
+	return efx->phc_ptp_data == efx->ptp_data && efx->ptp_data != NULL;
+}
+
 #if defined(EFX_NOT_UPSTREAM) && defined(CONFIG_SFC_PPS)
 static int efx_ptp_create_pps(struct efx_ptp_data *ptp)
 {
 	struct efx_pps_data *pps;
+	int rc;
 
 	pps = kzalloc(sizeof(*pps), GFP_ATOMIC);
 	if (!pps)
@@ -2606,9 +2664,34 @@ static int efx_ptp_create_pps(struct efx_ptp_data *ptp)
 
 	pps->ptp = ptp;
 	ptp->pps_data = pps;
+
+	if (efx_phc_exposed(ptp->efx)) {
+		pps->device = pps_register_source(&efx_pps_info,
+						  PPS_CAPTUREASSERT |
+						  PPS_OFFSETASSERT);
+
+		if (IS_ERR(pps->device))
+			goto fail2;
+
+		if (efx_ptp_hw_pps_enable(ptp->efx, true))
+			goto fail3;
+
+		rc = sysfs_create_link(&ptp->efx->pci_dev->dev.kobj,
+				       &pps->device->dev->kobj,
+				       "pps_device");
+
+		(void)rc;
+	}
+
 	kref_get(&ptp->kref);
 
 	return 0;
+
+fail3:
+	pps_unregister_source(pps->device);
+fail2:
+	kobject_del(&ptp->pps_data->kobj);
+	kobject_put(&ptp->pps_data->kobj);
 fail1:
 	kfree(pps);
 	ptp->pps_data = NULL;
@@ -2621,18 +2704,75 @@ static void efx_ptp_destroy_pps(struct efx_ptp_data *ptp)
 	if (!ptp->pps_data)
 		return;
 
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT)
+	/* Stop generating user space events */
+	ptp->usr_evt_enabled = 0;
+#endif
+	if (ptp->pps_data->device) {
+		sysfs_remove_link(&ptp->efx->pci_dev->dev.kobj, "pps_device");
+		efx_ptp_hw_pps_enable(ptp->efx, false);
+		pps_unregister_source(ptp->pps_data->device);
+	}
+
 	kobject_del(&ptp->pps_data->kobj);
 	kobject_put(&ptp->pps_data->kobj);
 }
 #endif
 
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT)
+static int efx_phc_enable(struct ptp_clock_info *ptp,
+			  struct ptp_clock_request *request,
+			  int enable)
+{
+	struct efx_ptp_data *ptp_data = container_of(ptp,
+						     struct efx_ptp_data,
+						     phc_clock_info);
+
+	switch (request->type) {
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PTP_PF_NONE)
+	case PTP_CLK_REQ_EXTTS:
+		if (ptp->pin_config[0].func != PTP_PF_EXTTS)
+			enable = false;
+		fallthrough;
+#endif
+	case PTP_CLK_REQ_PPS:
+		if (enable)
+			ptp_data->usr_evt_enabled |= (1 << request->type);
+		else
+			ptp_data->usr_evt_enabled &= ~(1 << request->type);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PTP_PF_NONE)
+static int efx_phc_verify(struct ptp_clock_info *ptp, unsigned int pin,
+			  enum ptp_pin_function func, unsigned int chan)
+{
+	switch (func) {
+	case PTP_PF_NONE:
+	case PTP_PF_EXTTS:
+		break;
+	default:
+		return -1;
+	}
+	return 0;
+}
+#endif
+
 static const struct ptp_clock_info efx_phc_clock_info = {
 	.owner		= THIS_MODULE,
 	.name		= "sfc",
 	.max_adj	= MAX_PPB, /* unused, ptp_data->max_adjfreq used instead */
 	.n_alarm	= 0,
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PTP_PF_NONE)
+	.n_ext_ts	= 1,
+	.n_pins		= 1,
+#else
 	.n_ext_ts	= 0,
+#endif
 	.n_per_out	= 0,
 	.pps		= 1,
 	.adjfreq	= efx_phc_adjfreq,
@@ -2645,10 +2785,14 @@ static const struct ptp_clock_info efx_phc_clock_info = {
 	.settime64	= efx_phc_settime,
 #endif
 	.enable		= efx_phc_enable,
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PTP_PF_NONE)
+	.verify		= efx_phc_verify,
+#endif
 };
 #endif
 
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT) || defined(EFX_NOT_UPSTREAM)
+#ifdef CONFIG_SFC_PPS
 static int efx_create_pps_worker(struct efx_ptp_data *ptp)
 {
 	char busdevice[11];
@@ -2673,6 +2817,7 @@ static int efx_create_pps_worker(struct efx_ptp_data *ptp)
 	return 0;
 }
 #endif
+#endif
 bool efx_ptp_uses_separate_channel(struct efx_nic *efx)
 {
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_NET_TSTAMP)
@@ -2682,34 +2827,32 @@ bool efx_ptp_uses_separate_channel(struct efx_nic *efx)
 #endif
 }
 
-/* Find interface on the same physical adapter (by port0 MAC address) and setup
- * efx->phc_efx. This cannot be merged with efx_associate() as efx_phc_exposed()
- * is required at probe time.
+/* Find PTP data of this adapter's PHC or add its own to the list.
  */
 static void efx_associate_phc(struct efx_nic *efx)
 {
-	struct efx_nic *other, *next;
+	struct efx_ptp_data *other, *next;
 	bool associated = false;
 
-	EFX_WARN_ON_PARANOID(efx->phc_efx);
-	spin_lock(&ptp_all_funcs_list_lock);
+	EFX_WARN_ON_PARANOID(efx->phc_ptp_data);
+	spin_lock(&ptp_all_phcs_list_lock);
 
-	list_for_each_entry_safe(other, next, &efx_all_funcs_list,
-				 node_ptp_all_funcs) {
-		EFX_WARN_ON_PARANOID(other == efx);
-		if (other->phc_efx == other &&
-		    ether_addr_equal(other->adapter_base_addr,
-				     efx->adapter_base_addr)) {
-			efx->phc_efx = other;
+	list_for_each_entry_safe(other, next, &efx_all_phcs_list,
+				 node_ptp_all_phcs) {
+		EFX_WARN_ON_PARANOID(other == efx->ptp_data);
+		if (ether_addr_equal(other->adapter_base_addr,
+ 				     efx->adapter_base_addr)) {
+			efx->phc_ptp_data = other;
+			kref_get(&other->kref);
 			goto out;
 		}
 	}
 
-	efx->phc_efx = efx;
+	efx->phc_ptp_data = efx->ptp_data;
+	list_add(&efx->phc_ptp_data->node_ptp_all_phcs, &efx_all_phcs_list);
 	associated = true;
 out:
-	list_add(&efx->node_ptp_all_funcs, &efx_all_funcs_list);
-	spin_unlock(&ptp_all_funcs_list_lock);
+	spin_unlock(&ptp_all_phcs_list_lock);
 
 	if (associated && !((efx->mcdi->fn_flags) &
 			    (1 << MC_CMD_DRV_ATTACH_EXT_OUT_FLAG_PRIMARY))) {
@@ -2722,50 +2865,51 @@ out:
 	}
 }
 
-/* Clear efx->phc_efx for any interface that points to this one.
+/* Release reference to phc_ptp_data or remove own ptp_data from list.
 */
 static void efx_dissociate_phc(struct efx_nic *efx)
 {
-	struct efx_nic *other, *next;
+	if (!efx->phc_ptp_data)
+		return;
 
-	spin_lock(&ptp_all_funcs_list_lock);
-
-	list_del(&efx->node_ptp_all_funcs);
-	list_for_each_entry_safe(other, next, &efx_all_funcs_list,
-		node_ptp_all_funcs) {
-		EFX_WARN_ON_PARANOID(other == efx);
-		if (other->phc_efx == efx)
-			other->phc_efx = NULL;
+	if (efx->ptp_data == efx->phc_ptp_data) {
+		spin_lock(&ptp_all_phcs_list_lock);
+		list_del(&efx->ptp_data->node_ptp_all_phcs);
+		spin_unlock(&ptp_all_phcs_list_lock);
+	} else {
+		kref_put(&efx->phc_ptp_data->kref, efx_ptp_delete_data);
+		efx->phc_ptp_data = NULL;
 	}
-
-	spin_unlock(&ptp_all_funcs_list_lock);
-}
-
-static inline bool efx_phc_exposed(struct efx_nic *efx)
-{
-	return efx->phc_efx == efx;
 }
 
 /* Initialise PTP state. */
 int efx_ptp_probe(struct efx_nic *efx, struct efx_channel *channel)
 {
 	struct efx_ptp_data *ptp;
-	int rc = 0;
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PTP_PF_NONE)
+	struct ptp_pin_desc *ppd;
+#endif
 	unsigned int pos;
+#ifdef CONFIG_SFC_PPS
+	bool pps_ok;
+#endif
+	int rc = 0;
 
 	ptp = kzalloc(sizeof(struct efx_ptp_data), GFP_KERNEL);
-	efx->ptp_data = ptp;
-	if (!efx->ptp_data)
+	if (!ptp)
 		return -ENOMEM;
+	efx->ptp_data = ptp;
 
 	rc = efx_mcdi_get_board_cfg(efx, 0, efx->adapter_base_addr, NULL,
 				    NULL);
 	if (rc < 0)
-		return rc;
+		goto fail1;
 
 	efx_associate_phc(efx);
 
 	ptp->efx = efx;
+	ether_addr_copy(ptp->adapter_base_addr, efx->adapter_base_addr);
+	ptp->ifindex = efx->net_dev->ifindex;
 	ptp->channel = channel;
 	ptp->rx_ts_inline = efx_nic_rev(efx) >= EFX_REV_HUNT_A0;
 	kref_init(&ptp->kref);
@@ -2780,24 +2924,23 @@ int efx_ptp_probe(struct efx_nic *efx, struct efx_channel *channel)
 
 #ifdef CONFIG_SFC_DEBUGFS
 	for (pos = 0; pos < (MC_CMD_PTP_OUT_STATUS_LEN / sizeof(u32)); pos++)
-		efx->ptp_data->mc_stats[pos] = pos;
+		ptp->mc_stats[pos] = pos;
 
-	rc = efx_extend_debugfs_port(efx, efx->ptp_data, 0,
-				     efx_debugfs_ptp_parameters);
+	rc = efx_extend_debugfs_port(efx, ptp, 0, efx_debugfs_ptp_parameters);
 	if (rc < 0)
-		goto fail;
+		goto fail2;
 #endif
 
 	rc = efx_nic_alloc_buffer(efx, &ptp->start, sizeof(int), GFP_KERNEL);
 	if (rc != 0)
-		goto fail1;
+		goto fail3;
 
 	skb_queue_head_init(&ptp->rxq);
 	skb_queue_head_init(&ptp->txq);
 	ptp->workwq = create_singlethread_workqueue("sfc_ptp");
 	if (!ptp->workwq) {
 		rc = -ENOMEM;
-		goto fail2;
+		goto fail4;
 	}
 
 	if (efx_ptp_use_mac_tx_timestamps(efx)) {
@@ -2821,46 +2964,64 @@ int efx_ptp_probe(struct efx_nic *efx, struct efx_channel *channel)
 	/* Get the NIC PTP attributes and set up time conversions */
 	rc = efx_ptp_get_attributes(efx);
 	if (rc < 0)
-		goto fail3;
+		goto fail5;
 
 	/* Get the timestamp corrections */
 	rc = efx_ptp_get_timestamp_corrections(efx);
 	if (rc < 0)
-		goto fail3;
+		goto fail5;
 
 	/* Set the NIC clock maximum frequency adjustment */
 	/* TODO: add MCDI call to get this value from the NIC */
 	ptp->max_adjfreq = MAX_PPB;
 
+#ifdef CONFIG_SFC_PPS
+	pps_ok = efx_is_pps_possible(efx);
+#endif
+
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT)
 	if (efx_phc_exposed(efx)) {
 		ptp->phc_clock_info = efx_phc_clock_info;
 		ptp->phc_clock_info.max_adj = ptp->max_adjfreq;
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PTP_PF_NONE)
+		ppd = &ptp->pin_config[0];
+		snprintf(ppd->name, sizeof(ppd->name), "pps0");
+		ppd->index = 0;
+		ppd->func = PTP_PF_EXTTS;
+		ptp->phc_clock_info.pin_config = ptp->pin_config;
+#endif
 		ptp->phc_clock = ptp_clock_register(&ptp->phc_clock_info,
 						    &efx->pci_dev->dev);
 		if (IS_ERR(ptp->phc_clock)) {
 			rc = PTR_ERR(ptp->phc_clock);
-			goto fail3;
+			goto fail5;
 		}
 		kref_get(&ptp->kref);
-		rc = efx_create_pps_worker(ptp);
-		if (rc < 0)
-			goto fail4;
 
+#ifdef CONFIG_SFC_PPS
+		rc = pps_ok ? efx_create_pps_worker(ptp) : 0;
+		if (rc < 0)
+			goto fail6;
+
+#endif
 	}
-	ptp->nic_ts_enabled = false;
-#elif defined(EFX_NOT_UPSTREAM)
-	rc = efx_create_pps_worker(ptp);
+	ptp->usr_evt_enabled = 0;
+#else
+#ifdef EFX_NOT_UPSTREAM
+#ifdef CONFIG_SFC_PPS
+	rc = pps_ok ? efx_create_pps_worker(ptp) : 0;
 	if (rc < 0)
-		goto fail3;
+		goto fail5;
+#endif
+#endif
 #endif
 
 #ifdef EFX_NOT_UPSTREAM
 
 #ifdef CONFIG_SFC_PPS
-	rc = efx_ptp_create_pps(ptp);
+	rc = pps_ok ? efx_ptp_create_pps(ptp) : 0;
 	if (rc < 0)
-		goto fail5;
+		goto fail7;
 #endif
 
 #ifdef CONFIG_SFC_DEBUGFS
@@ -2873,7 +3034,7 @@ int efx_ptp_probe(struct efx_nic *efx, struct efx_channel *channel)
 	rc = device_create_file(&efx->pci_dev->dev,
 				&dev_attr_ptp_stats);
 	if (rc < 0)
-		goto fail6;
+		goto fail8;
 #endif
 
 	/* Only advertise ptp_caps when a clock was exposed, otherwise
@@ -2884,61 +3045,68 @@ int efx_ptp_probe(struct efx_nic *efx, struct efx_channel *channel)
 		rc = device_create_file(&efx->pci_dev->dev,
 					&dev_attr_ptp_caps);
 		if (rc < 0)
-			goto fail7;
+			goto fail9;
 	}
 
+#if defined(EFX_NOT_UPSTREAM) && defined(CONFIG_SFC_PPS)
 	rc = device_create_file(&efx->pci_dev->dev, &dev_attr_max_adjfreq);
 	if (rc < 0)
-		goto fail8;
+		goto fail10;
+#endif
+#else
 
 #endif /* EFX_NOT_UPSTREAM */
 
 	return 0;
 
 #ifdef EFX_NOT_UPSTREAM
-fail8:
+#ifdef CONFIG_SFC_PPS
+fail10:
+#endif
 	if (efx_phc_exposed(efx))
 		device_remove_file(&efx->pci_dev->dev, &dev_attr_ptp_caps);
-fail7:
+fail9:
 #ifdef CONFIG_SFC_DEBUGFS
 	device_remove_file(&efx->pci_dev->dev, &dev_attr_ptp_stats);
-fail6:
+fail8:
 #endif
 #ifdef CONFIG_SFC_PPS
-	efx_ptp_destroy_pps(efx->ptp_data);
-fail5:
+	if (pps_ok)
+		efx_ptp_destroy_pps(ptp);
+fail7:
 #endif
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT)
-	if (ptp->phc_clock)
+	if (ptp->pps_workwq)
 		destroy_workqueue(ptp->pps_workwq);
 #endif
 #endif /* EFX_NOT_UPSTREAM */
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT)
-fail4:
-#ifdef EFX_NOT_UPSTREAM
-	kref_put(&ptp->kref, efx_ptp_delete_data);
+#ifdef CONFIG_SFC_PPS
+fail6:
 #endif
+	if (efx_phc_exposed(efx))
+		kref_put(&ptp->kref, efx_ptp_delete_data);
 	if (ptp->phc_clock)
 		ptp_clock_unregister(ptp->phc_clock);
 #endif
 
-fail3:
-	destroy_workqueue(efx->ptp_data->workwq);
+fail5:
+	destroy_workqueue(ptp->workwq);
+	ptp->workwq = NULL;
 
-fail2:
+fail4:
 	efx_nic_free_buffer(efx, &ptp->start);
 
-fail1:
+fail3:
 #ifdef CONFIG_SFC_DEBUGFS
 	efx_trim_debugfs_port(efx, efx_debugfs_ptp_parameters);
 
-fail:
-#endif
-#ifdef EFX_NOT_UPSTREAM
-	kref_put(&ptp->kref, efx_ptp_delete_data);
+fail2:
 #endif
 	efx_dissociate_phc(efx);
-
+fail1:
+	efx->ptp_data = NULL;
+	kfree(ptp);
 	return rc;
 }
 
@@ -2957,6 +3125,28 @@ static int efx_ptp_probe_channel(struct efx_channel *channel)
 	return efx_ptp_probe(efx, channel);
 }
 
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT) || defined(EFX_NOT_UPSTREAM)
+static void efx_ptp_remove_pps_workqueue(struct efx_ptp_data *ptp_data)
+{
+	struct workqueue_struct *pps_workwq = ptp_data->pps_workwq;
+	ptp_data->pps_workwq = NULL; /* tells worker to do nothing */
+
+	if (!pps_workwq)
+		return;
+
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_USE_CANCEL_WORK_SYNC)
+	cancel_work_sync(&ptp_data->pps_work);
+#endif
+
+	destroy_workqueue(pps_workwq);
+}
+#else
+static inline void efx_ptp_remove_pps_workqueue(struct efx_ptp_data *ptp_data)
+{
+	/* nothing to do */
+}
+#endif
+
 void efx_ptp_remove(struct efx_nic *efx)
 {
 	struct efx_ptp_data *ptp_data = efx->ptp_data;
@@ -2970,14 +3160,14 @@ void efx_ptp_remove(struct efx_nic *efx)
 	if (!efx->ptp_data || !efx->ptp_data->workwq)
 		return;
 
-	efx->ptp_data = NULL;
-	ptp_data->efx = NULL;
-
 	(void)efx_ptp_disable(efx);
 
 #if defined(EFX_NOT_UPSTREAM) && defined(CONFIG_SFC_PPS)
 	efx_ptp_destroy_pps(ptp_data);
 #endif
+
+	efx->ptp_data = NULL;
+	ptp_data->efx = NULL;
 
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_USE_CANCEL_WORK_SYNC)
 	cancel_work_sync(&ptp_data->work);
@@ -3002,38 +3192,30 @@ void efx_ptp_remove(struct efx_nic *efx)
 #ifdef EFX_NOT_UPSTREAM
 	if (efx_phc_exposed(efx) || ptp_data->phc_clock)
 		device_remove_file(&pci_dev->dev, &dev_attr_ptp_caps);
+#ifdef CONFIG_SFC_PPS
 	device_remove_file(&pci_dev->dev, &dev_attr_max_adjfreq);
+#endif
 #endif
 #ifdef CONFIG_SFC_DEBUGFS
 	device_remove_file(&pci_dev->dev, &dev_attr_ptp_stats);
 #endif
-#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT)
-	if (ptp_data->phc_clock)
-#endif
-#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT) || defined(EFX_NOT_UPSTREAM)
-		destroy_workqueue(ptp_data->pps_workwq);
-#endif
+	efx_ptp_remove_pps_workqueue(ptp_data);
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT)
 	if (ptp_data->phc_clock) {
 		ptp_clock_unregister(ptp_data->phc_clock);
-#ifdef EFX_NOT_UPSTREAM
-		kref_put(&ptp_data->kref, efx_ptp_delete_data);
-#endif
 	}
 #endif
 
 	destroy_workqueue(ptp_data->workwq);
 	ptp_data->workwq = NULL;
 
+	efx_dissociate_phc(efx);
 	efx_nic_free_buffer(efx, &ptp_data->start);
 #ifdef CONFIG_SFC_DEBUGFS
 	efx_trim_debugfs_port(efx, efx_debugfs_ptp_parameters);
 #endif
 
-#ifdef EFX_NOT_UPSTREAM
-	kref_put(&ptp_data->kref, efx_ptp_delete_data);
-#endif
-	efx_dissociate_phc(efx);
+	efx->ptp_data = NULL;
 }
 
 static void efx_ptp_remove_channel(struct efx_channel *channel)
@@ -3309,8 +3491,8 @@ static int efx_ptp_ts_init(struct efx_nic *efx, struct hwtstamp_config *init)
 
 void efx_ptp_get_ts_info(struct efx_nic *efx, struct ethtool_ts_info *ts_info)
 {
+	struct efx_ptp_data *phc_ptp = efx->phc_ptp_data;
 	struct efx_ptp_data *ptp = efx->ptp_data;
-	struct efx_nic *phc_efx = efx->phc_efx;
 
 	ASSERT_RTNL();
 
@@ -3335,13 +3517,12 @@ void efx_ptp_get_ts_info(struct efx_nic *efx, struct ethtool_ts_info *ts_info)
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT)
 	if (ptp->phc_clock)
 		ts_info->phc_index = ptp_clock_index(ptp->phc_clock);
-	else if (phc_efx && phc_efx->ptp_data && phc_efx->ptp_data->phc_clock)
-		ts_info->phc_index =
-			ptp_clock_index(phc_efx->ptp_data->phc_clock);
+	else if (phc_ptp && phc_ptp->phc_clock)
+		ts_info->phc_index = ptp_clock_index(phc_ptp->phc_clock);
 #else
-	/* Use phc_efx's ifindex as a fake clock index */
-	if (phc_efx && phc_efx->ptp_data)
-		ts_info->phc_index = phc_efx->net_dev->ifindex;
+	/* Use phc_ptp's ifindex as a fake clock index */
+	if (phc_ptp)
+		ts_info->phc_index = phc_ptp->ifindex;
 #endif
 	ts_info->tx_types = 1 << HWTSTAMP_TX_OFF | 1 << HWTSTAMP_TX_ON;
 	ts_info->rx_filters = ptp->efx->type->hwtstamp_filters;
@@ -3434,8 +3615,8 @@ static struct ptp_clock_info *efx_ptp_clock_info(struct efx_nic *efx)
 		return NULL;
 
 	phc_clock_info = &efx->ptp_data->phc_clock_info;
-	if (!phc_clock_info && efx->phc_efx && efx->phc_efx->ptp_data)
-		phc_clock_info = &efx->phc_efx->ptp_data->phc_clock_info;
+	if (!phc_clock_info && efx->phc_ptp_data)
+		phc_clock_info = &efx->phc_ptp_data->phc_clock_info;
 
 	return phc_clock_info;
 }
@@ -3676,6 +3857,26 @@ static void ptp_event_fault(struct efx_nic *efx, struct efx_ptp_data *ptp)
 
 static void ptp_event_pps(struct efx_nic *efx, struct efx_ptp_data *ptp)
 {
+#if defined(EFX_NOT_UPSTREAM) && defined(CONFIG_SFC_PPS)
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_PHC_SUPPORT)
+	struct ptp_clock_event ptp_evt;
+
+	if (ptp->usr_evt_enabled & (1 << PTP_CLK_REQ_EXTTS)) {
+		struct efx_pps_data *pps = ptp->pps_data;
+
+		pps->n_assert = ptp->nic_to_kernel_time(
+			EFX_QWORD_FIELD(ptp->evt_frags[0], MCDI_EVENT_DATA),
+			EFX_QWORD_FIELD(ptp->evt_frags[1], MCDI_EVENT_DATA),
+			ptp->ts_corrections.pps_in);
+
+		ptp_evt.type = PTP_CLOCK_EXTTS;
+		ptp_evt.index = 0;
+		ptp_evt.timestamp = ktime_to_ns(pps->n_assert);
+		ptp_clock_event(ptp->phc_clock, &ptp_evt);
+	}
+#endif
+#endif
+
 	if (efx && ptp->pps_workwq)
 		queue_work(ptp->pps_workwq, &ptp->pps_work);
 }
@@ -3684,6 +3885,7 @@ static void ptp_event_pps(struct efx_nic *efx, struct efx_ptp_data *ptp)
 static void hw_pps_event_pps(struct efx_nic *efx, struct efx_ptp_data *ptp)
 {
 	struct efx_pps_data *pps = efx->ptp_data->pps_data;
+	struct pps_event_time ts;
 
 	pps->n_assert = ptp->nic_to_kernel_time(
 		EFX_QWORD_FIELD(ptp->evt_frags[0], MCDI_EVENT_DATA),
@@ -3696,6 +3898,15 @@ static void hw_pps_event_pps(struct efx_nic *efx, struct efx_ptp_data *ptp)
 			pps->ptp->last_delta);
 		pps->s_delta = pps->ptp->last_delta;
 		pps->last_ev++;
+
+		if (pps->device) {
+#if defined(EFX_USE_KCOMPAT) && !defined(EFX_USE_64BIT_PHC)
+			ts.ts_real = ktime_to_timespec(pps->n_assert);
+#else
+			ts.ts_real = ktime_to_timespec64(pps->n_assert);
+#endif
+			pps_event(pps->device, &ts, PPS_CAPTUREASSERT, NULL);
+		}
 
 		if (waitqueue_active(&pps->read_data))
 			wake_up(&pps->read_data);
@@ -3713,12 +3924,8 @@ static bool efx_ptp_warn_once(struct efx_nic *efx)
 
 void efx_ptp_event(struct efx_nic *efx, efx_qword_t *ev)
 {
-	struct efx_ptp_data *ptp;
-	struct efx_nic *phc_efx;
 	int code = EFX_QWORD_FIELD(*ev, MCDI_EVENT_CODE);
-
-	phc_efx = efx->phc_efx;
-	ptp = phc_efx ? phc_efx->ptp_data : NULL;
+	struct efx_ptp_data *ptp = efx->phc_ptp_data;
 
 	if (!ptp) {
 		if (efx_ptp_warn_once(efx))
@@ -3726,7 +3933,8 @@ void efx_ptp_event(struct efx_nic *efx, efx_qword_t *ev)
 				   "Received PTP event (code %d) but PTP not set up\n",
 				   code);
 		return;
-	}
+	} else if (!ptp->efx)
+		return; /* PTP data is being removed, ignore */
 
 	if (ptp->evt_frag_idx == 0) {
 		ptp->evt_code = code;
@@ -3736,7 +3944,7 @@ void efx_ptp_event(struct efx_nic *efx, efx_qword_t *ev)
 		ptp->evt_frag_idx = 0;
 	}
 	/* Relay all events to the PF that administers the hardware */
-	efx = phc_efx;
+	efx = ptp->efx;
 
 	ptp->evt_frags[ptp->evt_frag_idx++] = *ev;
 	if (!MCDI_EVENT_FIELD(*ev, CONT)) {
@@ -3773,8 +3981,6 @@ void efx_time_sync_event(struct efx_channel *channel, efx_qword_t *ev)
 {
 	struct efx_nic *efx = channel->efx;
 	struct efx_ptp_data *ptp = efx->ptp_data;
-
-	// TODO test ptp null?
 
 	/* When extracting the sync timestamp minor value, we should discard
 	 * the least significant two bits. These are not required in order
@@ -3958,8 +4164,8 @@ static int efx_phc_gettime(struct ptp_clock_info *ptp, struct timespec64 *ts)
 	struct efx_nic *efx = ptp_data->efx;
 	MCDI_DECLARE_BUF(inbuf, MC_CMD_PTP_IN_READ_NIC_TIME_LEN);
 	MCDI_DECLARE_BUF(outbuf, MC_CMD_PTP_OUT_READ_NIC_TIME_LEN);
-	int rc;
 	ktime_t kt;
+	int rc;
 
 	MCDI_SET_DWORD(inbuf, PTP_IN_OP, MC_CMD_PTP_OP_READ_NIC_TIME);
 	MCDI_SET_DWORD(inbuf, PTP_IN_PERIPH_ID, 0);
@@ -3998,20 +4204,6 @@ static int efx_phc_settime(struct ptp_clock_info *ptp,
 	if (rc != 0)
 		return rc;
 
-	return 0;
-}
-
-static int efx_phc_enable(struct ptp_clock_info *ptp,
-			  struct ptp_clock_request *request,
-			  int enable)
-{
-	struct efx_ptp_data *ptp_data = container_of(ptp,
-						     struct efx_ptp_data,
-						     phc_clock_info);
-	if (request->type != PTP_CLK_REQ_PPS)
-		return -EOPNOTSUPP;
-
-	ptp_data->nic_ts_enabled = !!enable;
 	return 0;
 }
 

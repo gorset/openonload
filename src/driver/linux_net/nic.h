@@ -376,9 +376,9 @@ enum {
  * @vlan_lock: Lock to serialize access to vlan_list.
  * @udp_tunnel_work: workitem for pushing UDP tunnel ports to the MC
  * @udp_tunnels: UDP tunnel port numbers and types.
- * @udp_tunnels_busy: Indicates whether efx_ef10_set_udp_tnl_ports() is
- *	currently running.
- * @udp_tunnels_lock: Serialises writes to @udp_tunnels and @udp_tunnels_busy.
+ * @udp_tunnels_dirty: flag indicating a reboot occurred while pushing
+ *	@udp_tunnels to hardware and thus the push must be re-done.
+ * @udp_tunnels_lock: Serialises writes to @udp_tunnels and @udp_tunnels_dirty.
  */
 struct efx_ef10_nic_data {
 	struct efx_nic *efx;
@@ -425,10 +425,16 @@ struct efx_ef10_nic_data {
 	u8 vport_mac[ETH_ALEN];
 	struct list_head vlan_list;
 	struct mutex vlan_lock;
-	struct work_struct udp_tunnel_work;
 	struct efx_udp_tunnel udp_tunnels[16];
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
+	bool udp_tunnels_dirty;
+	struct mutex udp_tunnels_lock;
+#else
+	/* Indicates whether efx_ef10_set_udp_tnl_ports() is currently running.	*/
 	bool udp_tunnels_busy;
 	spinlock_t udp_tunnels_lock;
+	struct work_struct udp_tunnel_work;
+#endif
 	u64 licensed_features;
 };
 
@@ -543,8 +549,20 @@ static inline ktime_t efx_ptp_nic_to_kernel_time(struct efx_tx_queue *tx_queue)
 #if defined(EFX_NOT_UPSTREAM) && defined(CONFIG_SFC_PPS)
 struct efx_ts_get_pps;
 struct efx_ts_hw_pps;
+#ifdef CONFIG_SFC_PTP
 int efx_ptp_pps_get_event(struct efx_nic *efx, struct efx_ts_get_pps *data);
-int efx_ptp_hw_pps_enable(struct efx_nic *efx, struct efx_ts_hw_pps *data);
+int efx_ptp_hw_pps_enable(struct efx_nic *efx, bool enable);
+#else
+static inline int efx_ptp_pps_get_event(struct efx_nic *efx,
+					struct efx_ts_get_pps *data)
+{
+	return -EOPNOTSUPP;
+}
+static inline int efx_ptp_hw_pps_enable(struct efx_nic *efx, bool enable)
+{
+	return -EOPNOTSUPP;
+}
+#endif
 #endif
 
 #if defined(EFX_NOT_UPSTREAM) && defined(CONFIG_SFC_AOE)

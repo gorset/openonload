@@ -21,6 +21,9 @@
 #include <linux/jhash.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
+#include <net/udp_tunnel.h>
+#endif
 #ifdef EFX_NOT_UPSTREAM
 #include "efx_ioctl.h"
 #endif
@@ -191,8 +194,14 @@ static int efx_ef10_filter_add_vlan(struct efx_nic *efx, u16 vid);
 static void efx_ef10_filter_del_vlan_internal(struct efx_nic *efx,
 					      struct efx_ef10_filter_vlan *vlan);
 static void efx_ef10_filter_del_vlan(struct efx_nic *efx, u16 vid);
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
+static const struct udp_tunnel_nic_info efx_ef10_udp_tunnels;
+static int efx_ef10_set_udp_tnl_ports(struct efx_nic *efx, bool unloading);
+#else
 static int efx_ef10_set_udp_tnl_ports(struct efx_nic *efx, bool unloading)
 	__releases(nic_data->udp_tunnels_lock);
+static void efx_ef10__udp_tnl_push_ports(struct work_struct *data);
+#endif
 #ifdef CONFIG_SFC_SRIOV
 static void efx_ef10_vf_update_stats_work(struct work_struct *data);
 #endif
@@ -980,8 +989,6 @@ static DEVICE_ATTR(link_control_flag, 0444, efx_ef10_show_link_control_flag,
 static DEVICE_ATTR(primary_flag, 0444, efx_ef10_show_primary_flag,
 		   NULL);
 
-static void efx_ef10__udp_tnl_push_ports(struct work_struct *data);
-
 static int efx_ef10_probe(struct efx_nic *efx)
 {
 	struct efx_ef10_nic_data *nic_data;
@@ -1046,9 +1053,16 @@ static int efx_ef10_probe(struct efx_nic *efx)
 		return 0;
 #endif
 
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
+	mutex_init(&nic_data->udp_tunnels_lock);
+	for (i = 0; i < ARRAY_SIZE(nic_data->udp_tunnels); ++i)
+		nic_data->udp_tunnels[i].type =
+			TUNNEL_ENCAP_UDP_PORT_ENTRY_INVALID;
+#else
 	spin_lock_init(&nic_data->udp_tunnels_lock);
 	nic_data->udp_tunnels_busy = false;
 	INIT_WORK(&nic_data->udp_tunnel_work, efx_ef10__udp_tnl_push_ports);
+#endif
 
 	/* Reset (most) configuration for this function */
 	rc = efx_mcdi_reset(efx, RESET_TYPE_ALL);
@@ -1080,6 +1094,13 @@ static int efx_ef10_probe(struct efx_nic *efx)
 	rc = efx_ef10_init_datapath_caps(efx);
 	if (rc < 0)
 		goto fail5;
+
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
+	if (efx_ef10_has_cap(nic_data->datapath_caps, VXLAN_NVGRE) &&
+	    efx->mcdi->fn_flags &
+	    (1 << MC_CMD_DRV_ATTACH_EXT_OUT_FLAG_TRUSTED))
+		efx->net_dev->udp_tunnel_nic_info = &efx_ef10_udp_tunnels;
+#endif
 
 	nic_data->mc_stats = kmalloc(efx->num_mac_stats * sizeof(__le64),
 				GFP_KERNEL);
@@ -1747,7 +1768,9 @@ static void efx_ef10_remove(struct efx_nic *efx)
 	struct efx_nic *efx_pf;
 	struct ef10_vf *vf;
 #endif
+#if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
 	int i;
+#endif
 
 #if defined(CONFIG_SFC_SRIOV) && (!defined(EFX_USE_KCOMPAT) || (defined(EFX_HAVE_NDO_SET_VF_MAC) && defined(EFX_HAVE_PHYSFN)))
 	if (efx->pci_dev->is_virtfn) {
@@ -1800,6 +1823,12 @@ static void efx_ef10_remove(struct efx_nic *efx)
 	device_remove_file(&efx->pci_dev->dev, &dev_attr_primary_flag);
 	device_remove_file(&efx->pci_dev->dev, &dev_attr_link_control_flag);
 
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
+	memset(nic_data->udp_tunnels, 0, sizeof(nic_data->udp_tunnels));
+	mutex_lock(&nic_data->udp_tunnels_lock);
+	(void)efx_ef10_set_udp_tnl_ports(efx, true);
+	mutex_unlock(&nic_data->udp_tunnels_lock);
+#else
 	cancel_work_sync(&nic_data->udp_tunnel_work);
 
 	/* mark all UDP tunnel ports for remove... */
@@ -1813,6 +1842,7 @@ static void efx_ef10_remove(struct efx_nic *efx)
 		nic_data->udp_tunnels[i].removing = true;
 	/* ... then remove them */
 	efx_ef10_set_udp_tnl_ports(efx, true); /* drops the lock */
+#endif
 
 	efx_mcdi_detach(efx);
 
@@ -2422,13 +2452,17 @@ static int efx_ef10_map_reset_flags(u32 *flags)
 
 static int efx_ef10_reset(struct efx_nic *efx, enum reset_type reset_type)
 {
+#if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
 	struct efx_ef10_nic_data *nic_data = efx->nic_data;
+#endif
 	int rc;
 
+#if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
 	/* Make sure any UDP tunnel work has finished, else it could cause more
 	 * MC reboots during reset_up
 	 */
 	flush_work(&nic_data->udp_tunnel_work);
+#endif
 
 	rc = efx_mcdi_reset(efx, reset_type);
 
@@ -2447,6 +2481,7 @@ static int efx_ef10_reset(struct efx_nic *efx, enum reset_type reset_type)
 	 * resources assigned to us, so we have to trigger reallocation now.
 	 */
 	if ((reset_type == RESET_TYPE_ALL ||
+	     reset_type == RESET_TYPE_RECOVER_OR_ALL ||
 	     reset_type == RESET_TYPE_MCDI_TIMEOUT) && !rc)
 		efx_ef10_reset_mc_allocations(efx);
 	return rc;
@@ -2855,7 +2890,8 @@ static size_t efx_ef10_update_stats_common(struct efx_nic *efx, u64 *full_stats,
 	if (!core_stats)
 		return stats_count;
 
-	if (efx_ef10_has_cap(nic_data->datapath_caps, EVB)) {
+#ifdef CONFIG_SFC_SRIOV
+	if (efx->vf_count) {
 		/* Use vadaptor stats. */
 		core_stats->rx_packets = stats[EF10_STAT_rx_unicast] +
 					 stats[EF10_STAT_rx_multicast] +
@@ -2877,6 +2913,7 @@ static size_t efx_ef10_update_stats_common(struct efx_nic *efx, u64 *full_stats,
 		core_stats->rx_errors = core_stats->rx_crc_errors;
 		core_stats->tx_errors = stats[EF10_STAT_tx_bad];
 	} else {
+#endif
 		/* Use port stats. */
 		core_stats->rx_packets = stats[EF10_STAT_port_rx_packets];
 		core_stats->tx_packets = stats[EF10_STAT_port_tx_packets];
@@ -2896,8 +2933,9 @@ static size_t efx_ef10_update_stats_common(struct efx_nic *efx, u64 *full_stats,
 		core_stats->rx_errors = (core_stats->rx_length_errors +
 					 core_stats->rx_crc_errors +
 					 core_stats->rx_frame_errors);
+#ifdef CONFIG_SFC_SRIOV
 	}
-
+#endif
 	return stats_count;
 }
 
@@ -4430,6 +4468,7 @@ static int efx_debugfs_read_filter_list(struct seq_file *file, void *data)
 	return 0;
 }
 
+#if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
 static int efx_debugfs_udp_tunnels(struct seq_file *file, void *data)
 {
 	struct efx_nic *efx = data;
@@ -4452,6 +4491,7 @@ static int efx_debugfs_udp_tunnels(struct seq_file *file, void *data)
 	spin_unlock_bh(&nic_data->udp_tunnels_lock);
 	return 0;
 }
+#endif
 
 static int efx_debugfs_read_netdev_uc_addr(struct seq_file *file, void *data)
 {
@@ -4530,7 +4570,9 @@ static int efx_debugfs_read_netdev_dev_addr(struct seq_file *file, void *data)
 
 static struct efx_debugfs_parameter efx_debugfs[] = {
 	_EFX_RAW_PARAMETER(filters, efx_debugfs_read_filter_list),
+#if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
 	_EFX_RAW_PARAMETER(udp_tunnels, efx_debugfs_udp_tunnels),
+#endif
 	{NULL},
 };
 
@@ -8594,6 +8636,251 @@ static int efx_ef10_vlan_rx_kill_vid(struct efx_nic *efx, __be16 proto, u16 vid)
 }
 #endif
 
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
+/* We rely on the MCDI wiping out our TX rings if it made any changes to the
+ * ports table, ensuring that any TSO descriptors that were made on a now-
+ * removed tunnel port will be blown away and won't break things when we try
+ * to transmit them using the new ports table.
+ */
+static int efx_ef10_set_udp_tnl_ports(struct efx_nic *efx, bool unloading)
+{
+	MCDI_DECLARE_BUF(inbuf, MC_CMD_SET_TUNNEL_ENCAP_UDP_PORTS_IN_LENMAX);
+	MCDI_DECLARE_BUF(outbuf, MC_CMD_SET_TUNNEL_ENCAP_UDP_PORTS_OUT_LEN);
+	struct efx_ef10_nic_data *nic_data = efx->nic_data;
+	efx_dword_t flags_and_num_entries;
+	bool will_reset = false;
+	size_t num_entries = 0;
+	size_t inlen, outlen;
+	size_t i;
+	int rc;
+
+	WARN_ON(!mutex_is_locked(&nic_data->udp_tunnels_lock));
+
+	nic_data->udp_tunnels_dirty = false;
+
+	if (!efx_ef10_has_cap(nic_data->datapath_caps, VXLAN_NVGRE)) {
+		efx_device_attach_if_not_resetting(efx);
+		return 0;
+	}
+
+	BUILD_BUG_ON(ARRAY_SIZE(nic_data->udp_tunnels) >
+		     MC_CMD_SET_TUNNEL_ENCAP_UDP_PORTS_IN_ENTRIES_MAXNUM);
+
+	for (i = 0; i < ARRAY_SIZE(nic_data->udp_tunnels); ++i) {
+		if (nic_data->udp_tunnels[i].type !=
+		    TUNNEL_ENCAP_UDP_PORT_ENTRY_INVALID) {
+			efx_dword_t entry;
+
+			EFX_POPULATE_DWORD_2(entry,
+				TUNNEL_ENCAP_UDP_PORT_ENTRY_UDP_PORT,
+					ntohs(nic_data->udp_tunnels[i].port),
+				TUNNEL_ENCAP_UDP_PORT_ENTRY_PROTOCOL,
+					nic_data->udp_tunnels[i].type);
+			*_MCDI_ARRAY_DWORD(inbuf,
+				SET_TUNNEL_ENCAP_UDP_PORTS_IN_ENTRIES,
+				num_entries++) = entry;
+		}
+	}
+
+	/* Adding/removing a UDP tunnel can cause an MC reboot. We must
+	 * prevent causing too many reboots in a second.
+	 */
+	efx->reset_count = 0;
+
+	BUILD_BUG_ON((MC_CMD_SET_TUNNEL_ENCAP_UDP_PORTS_IN_NUM_ENTRIES_OFST -
+		      MC_CMD_SET_TUNNEL_ENCAP_UDP_PORTS_IN_FLAGS_OFST) * 8 !=
+		     EFX_WORD_1_LBN);
+	BUILD_BUG_ON(MC_CMD_SET_TUNNEL_ENCAP_UDP_PORTS_IN_NUM_ENTRIES_LEN * 8 !=
+		     EFX_WORD_1_WIDTH);
+	EFX_POPULATE_DWORD_2(flags_and_num_entries,
+			     MC_CMD_SET_TUNNEL_ENCAP_UDP_PORTS_IN_UNLOADING,
+				!!unloading,
+			     EFX_WORD_1, num_entries);
+	*_MCDI_DWORD(inbuf, SET_TUNNEL_ENCAP_UDP_PORTS_IN_FLAGS) =
+		flags_and_num_entries;
+
+	inlen = MC_CMD_SET_TUNNEL_ENCAP_UDP_PORTS_IN_LEN(num_entries);
+
+	rc = efx_mcdi_rpc_quiet(efx, MC_CMD_SET_TUNNEL_ENCAP_UDP_PORTS,
+				inbuf, inlen, outbuf, sizeof(outbuf), &outlen);
+	if (rc == -EIO) {
+		/* Most likely the MC rebooted due to another function also
+		 * setting its tunnel port list. Mark the tunnel port list as
+		 * dirty, so it will be pushed upon coming up from the reboot.
+		 */
+		nic_data->udp_tunnels_dirty = true;
+		/* We detached earlier, expecting an MC reset to trigger a
+	         * re-attach. If we haven't allocated event queues, we won't
+		 * see the notification. In this case we're not using any
+		 * resources, so we don't actually need to do any reset
+		 * handling except to forget some resources and reattach.
+		 */
+		if (!unloading && efx->state != STATE_READY) {
+			efx_device_attach_if_not_resetting(efx);
+			efx_ef10_mcdi_reboot_detected(efx);
+		}
+		return 0;
+	}
+
+	if (rc) {
+		/* expected not available on unprivileged functions */
+		if (rc != -EPERM)
+			netif_warn(efx, drv, efx->net_dev,
+				   "Unable to set UDP tunnel ports; rc=%d.\n", rc);
+	} else if (MCDI_DWORD(outbuf, SET_TUNNEL_ENCAP_UDP_PORTS_OUT_FLAGS) &
+		   (1 << MC_CMD_SET_TUNNEL_ENCAP_UDP_PORTS_OUT_RESETTING_LBN)) {
+		netif_info(efx, drv, efx->net_dev,
+			   "Rebooting MC due to UDP tunnel port list change\n");
+		will_reset = true;
+		if (unloading)
+			/* Delay for the MC reset to complete. This will make
+			 * unloading other functions a bit smoother. This is a
+			 * race, but the other unload will work whichever way
+			 * it goes, this just avoids an unnecessary error
+			 * message.
+			 */
+			msleep(100);
+	}
+	/* We detached earlier, expecting an MC reset to trigger a
+	 * re-attach.
+	 * But, there are two cases this won't happen: If the MC tells
+	 * us it's not going to reset, just reattach and carry on.
+	 * Alternatively, if the MC tells us it will reset but we haven't
+	 * allocated event queues, we won't see the notification. In this
+	 * case we're not using any resources, so we don't actually
+	 * need to do any reset handling except to forget some
+	 * resources and reattach.
+	 */
+	if (!unloading) {
+		if (will_reset && efx->state != STATE_READY)
+			efx_ef10_mcdi_reboot_detected(efx);
+		if (!will_reset || efx->state != STATE_READY)
+			efx_device_attach_if_not_resetting(efx);
+	}
+
+	return rc;
+}
+
+static int efx_ef10_udp_tnl_push_ports(struct efx_nic *efx)
+{
+	struct efx_ef10_nic_data *nic_data = efx->nic_data;
+	int rc = 0;
+
+	mutex_lock(&nic_data->udp_tunnels_lock);
+	if (nic_data->udp_tunnels_dirty) {
+		/* Make sure all TX are stopped while we modify the table, else
+		 * we might race against an efx_features_check().
+		 * If we fail early in probe, we won't have set up our TXQs yet,
+		 * in which case we don't need to do this (and trying wouldn't
+		 * end well).  So check we've called register_netdevice().
+		 */
+		if (efx->net_dev->reg_state == NETREG_REGISTERED)
+			efx_device_detach_sync(efx);
+		rc = efx_ef10_set_udp_tnl_ports(efx, false);
+	}
+	mutex_unlock(&nic_data->udp_tunnels_lock);
+	return rc;
+}
+
+static int efx_ef10_udp_tnl_set_port(struct net_device *dev,
+				     unsigned int table, unsigned int entry,
+				     struct udp_tunnel_info *ti)
+{
+	struct efx_nic *efx = netdev_priv(dev);
+	struct efx_ef10_nic_data *nic_data;
+	int efx_tunnel_type, rc;
+
+	if (ti->type == UDP_TUNNEL_TYPE_VXLAN)
+		efx_tunnel_type = TUNNEL_ENCAP_UDP_PORT_ENTRY_VXLAN;
+	else
+		efx_tunnel_type = TUNNEL_ENCAP_UDP_PORT_ENTRY_GENEVE;
+
+	nic_data = efx->nic_data;
+	if (!efx_ef10_has_cap(nic_data->datapath_caps, VXLAN_NVGRE))
+		return -EOPNOTSUPP;
+
+	mutex_lock(&nic_data->udp_tunnels_lock);
+	/* Make sure all TX are stopped while we modify the table, else
+	 * we might race against an efx_features_check().
+	 * If we fail early in probe, we won't have set up our TXQs yet,
+	 * in which case we don't need to do this (and trying wouldn't
+	 * end well).  So check we've called register_netdevice().
+	 */
+	if (efx_dev_registered(efx))
+		efx_device_detach_sync(efx);
+	nic_data->udp_tunnels[entry].type = efx_tunnel_type;
+	nic_data->udp_tunnels[entry].port = ti->port;
+	rc = efx_ef10_set_udp_tnl_ports(efx, false);
+	mutex_unlock(&nic_data->udp_tunnels_lock);
+
+	return rc;
+}
+
+/* Called under the TX lock with the TX queue running, hence no-one can be
+ * in the middle of updating the UDP tunnels table.  However, they could
+ * have tried and failed the MCDI, in which case they'll have set the dirty
+ * flag before dropping their locks.
+ */
+static bool efx_ef10_udp_tnl_has_port(struct efx_nic *efx, __be16 port)
+{
+	struct efx_ef10_nic_data *nic_data = efx->nic_data;
+	size_t i;
+
+	if (!efx_ef10_has_cap(nic_data->datapath_caps, VXLAN_NVGRE))
+		return false;
+
+	if (nic_data->udp_tunnels_dirty)
+		/* SW table may not match HW state, so just assume we can't
+		 * use any UDP tunnel offloads.
+		 */
+		return false;
+
+	for (i = 0; i < ARRAY_SIZE(nic_data->udp_tunnels); ++i)
+		if (nic_data->udp_tunnels[i].type !=
+		    TUNNEL_ENCAP_UDP_PORT_ENTRY_INVALID &&
+		    nic_data->udp_tunnels[i].port == port)
+			return true;
+
+	return false;
+}
+
+static int efx_ef10_udp_tnl_unset_port(struct net_device *dev,
+				       unsigned int table __always_unused,
+				       unsigned int entry,
+				       struct udp_tunnel_info *ti __always_unused)
+{
+	struct efx_nic *efx = netdev_priv(dev);
+	struct efx_ef10_nic_data *nic_data;
+	int rc;
+
+	nic_data = efx->nic_data;
+
+	mutex_lock(&nic_data->udp_tunnels_lock);
+	/* Make sure all TX are stopped while we remove from the table, else we
+	 * might race against an efx_features_check().
+	 */
+	efx_device_detach_sync(efx);
+	nic_data->udp_tunnels[entry].type = TUNNEL_ENCAP_UDP_PORT_ENTRY_INVALID;
+	nic_data->udp_tunnels[entry].port = 0;
+	rc = efx_ef10_set_udp_tnl_ports(efx, false);
+	mutex_unlock(&nic_data->udp_tunnels_lock);
+
+	return rc;
+}
+
+static const struct udp_tunnel_nic_info efx_ef10_udp_tunnels = {
+	.set_port	= efx_ef10_udp_tnl_set_port,
+	.unset_port	= efx_ef10_udp_tnl_unset_port,
+	.flags          = UDP_TUNNEL_NIC_INFO_MAY_SLEEP,
+	.tables         = {
+		{
+			.n_entries = 16,
+			.tunnel_types = UDP_TUNNEL_TYPE_VXLAN |
+					UDP_TUNNEL_TYPE_GENEVE,
+		},
+	},
+};
+#else
 /* We rely on the MCDI wiping out our TX rings if it made any changes to the
  * ports table, ensuring that any TSO descriptors that were made on a now-
  * removed tunnel port will be blown away and won't break things when we try
@@ -8948,6 +9235,7 @@ out_unlock:
 		msleep(200);
 	return;
 }
+#endif
 
 #if !defined(EFX_USE_KCOMPAT) || defined(NETIF_F_IPV6_CSUM)
 #define EF10_OFFLOAD_FEATURES		\
@@ -9232,10 +9520,13 @@ const struct efx_nic_type efx_hunt_a0_nic_type = {
 	.vlan_rx_add_vid = efx_ef10_vlan_rx_add_vid,
 	.vlan_rx_kill_vid = efx_ef10_vlan_rx_kill_vid,
 #endif
-	.udp_tnl_push_ports = efx_ef10_udp_tnl_push_ports_sync,
-	.udp_tnl_add_port = efx_ef10_udp_tnl_add_port,
 	.udp_tnl_has_port = efx_ef10_udp_tnl_has_port,
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
+	.udp_tnl_push_ports = efx_ef10_udp_tnl_push_ports,
+#else
+	.udp_tnl_add_port = efx_ef10_udp_tnl_add_port,
 	.udp_tnl_del_port = efx_ef10_udp_tnl_del_port,
+#endif
 	.vport_add = efx_ef10_vport_alloc,
 	.vport_del = efx_ef10_vport_free,
 	.vports_restore = efx_ef10_restore_vports,

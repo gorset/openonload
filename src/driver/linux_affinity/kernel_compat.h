@@ -6,9 +6,13 @@
 
 #include "driver/linux_affinity/autocompat.h"
 #include <linux/proc_fs.h>
+#include <linux/version.h>
+#include <linux/net.h>
+#include <linux/uaccess.h>
 
 #if !defined(EFRM_HAVE_PROC_CREATE_DATA) && \
-    !defined(EFRM_HAVE_PROC_CREATE_DATA_UMODE)
+    !defined(EFRM_HAVE_PROC_CREATE_DATA_UMODE) && \
+    !defined(EFRM_HAVE_PROC_CREATE_DATA_PROC_OPS)
 #ifdef EFRM_HAVE_PROC_CREATE
 static inline struct proc_dir_entry *
 proc_create_data(const char *name, umode_t mode,
@@ -128,6 +132,74 @@ static inline struct inode *file_inode(const struct file *f)
 #define get_netns_id(net_ns)     ((net_ns)->proc_inum)
 #else
 #define get_netns_id(net_ns)     0
+#endif
+
+
+/* Compat for linux < 5.5 */
+#ifndef EFRM_HAVE_STRUCT_PROC_OPS
+#define proc_ops file_operations
+#define proc_open open
+#define proc_read read
+#define proc_write write
+#define proc_lseek llseek
+#define proc_release release
+#define PROC_OPS_SET_OWNER .owner = THIS_MODULE,
+#else
+#define PROC_OPS_SET_OWNER
+#endif
+
+/* Compat for linux <= 3.16 */
+#ifndef EFRM_HAS_STRUCT_TIMESPEC64
+#define timespec64 timespec
+#endif
+#ifndef EFRM_HAS_KTIME_GET_TS64
+#define ktime_get_ts64 ktime_get_ts
+#endif
+
+/* Linux < 5.8 does not have mmap_write_lock() */
+#ifndef EFRM_HAVE_MMAP_LOCK_WRAPPERS
+static inline void mmap_write_lock(struct mm_struct *mm)
+{
+  down_write(&mm->mmap_sem);
+}
+static inline void mmap_write_unlock(struct mm_struct *mm)
+{
+  up_write(&mm->mmap_sem);
+}
+static inline void mmap_read_lock(struct mm_struct *mm)
+{
+  down_read(&mm->mmap_sem);
+}
+static inline void mmap_read_unlock(struct mm_struct *mm)
+{
+  up_read(&mm->mmap_sem);
+}
+#endif
+
+/* For linux<=5.7 you can use kernel_setsockopt(),
+ * but newer versions doe not have this function. */
+static inline int sock_ops_setsockopt(struct socket *sock,
+                                      int level, int optname,
+                                      char *optval, unsigned int optlen)
+{
+  int rc;
+#ifndef EFRM_HAS_SOCKPTR
+  mm_segment_t oldfs = get_fs();
+
+  /* You should call sock_setsockopt() for SOL_SOCKET */
+  WARN_ON(level == SOL_SOCKET);
+
+  set_fs(KERNEL_DS);
+  rc = sock->ops->setsockopt(sock, level, optname, optval, optlen);
+  set_fs(oldfs);
+#else
+  rc = sock->ops->setsockopt(sock, level, optname,
+                             KERNEL_SOCKPTR(optval), optlen);
+#endif
+  return rc;
+}
+#ifndef EFRM_HAS_SOCKPTR
+#define USER_SOCKPTR(val) val
 #endif
 
 #endif

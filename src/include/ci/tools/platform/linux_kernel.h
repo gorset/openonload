@@ -123,10 +123,10 @@ ci_inline void  __ci_vfree(void* p)    { return vfree(p);   }
   #define ci_vfree        __ci_vfree
 #endif
 
-#define ci_sprintf        sprintf
-#define ci_vsprintf       vsprintf
 #define ci_snprintf       snprintf
 #define ci_vsnprintf      vsnprintf
+#define ci_scnprintf      scnprintf
+#define ci_vscnprintf     vscnprintf
 #define ci_sscanf         sscanf
 
 
@@ -416,26 +416,27 @@ ci_inline uid_t ci_getuid(void)
 #endif
 }
 
-ci_inline uid_t ci_getgid(void)
+ci_inline uid_t ci_getegid(void)
 {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,27)
-  return current->gid;
+  return current->egid;
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(3,5,0)
-  return current_gid();
+  return current_egid();
 #else
-  return from_kgid(&init_user_ns, current_gid());
+  return from_kgid(&init_user_ns, current_egid());
 #endif
 }
 
-
-/* net_random was removed in Linux 3.14, and this was backported to
- * some earlier RedHat kernels (e.g. RHEL 7.4)
- */
-#ifdef EFRM_HAVE_PRANDOM_U32
-#define ci_net_random() prandom_u32()
+/* gid: -2 - none group, -1 - everyone group or actual gid */
+ci_inline int ci_in_egroup(int gid)
+{
+  return gid != -2 && (gid == -1 ||
+#ifndef KGIDT_INIT /* appeared in 3.5.0 */
+      in_egroup_p((unsigned)gid));
 #else
-#define ci_net_random() net_random()
+      in_egroup_p(KGIDT_INIT(gid)));
 #endif
+}
 
 
 /* Although some support for user namespaces is present in earlier kernel

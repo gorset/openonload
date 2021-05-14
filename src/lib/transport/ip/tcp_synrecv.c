@@ -690,7 +690,6 @@ int ci_tcp_listenq_try_promote(ci_netif* netif, ci_tcp_socket_listen* tls,
                                ci_tcp_state** ts_out)
 {
   int rc = 0;
-  int rx_n, max_rx_n;
 
   ci_assert(netif);
   ci_assert(tls);
@@ -698,11 +697,15 @@ int ci_tcp_listenq_try_promote(ci_netif* netif, ci_tcp_socket_listen* tls,
   ci_assert(tsr);
 
   if( NI_OPTS(netif).endpoint_packet_reserve != 0 &&
-      (rx_n = ci_netif_pkt_rx_n(netif)) >
-      (max_rx_n = CI_MIN(ci_netif_pkt_free_n(netif),
-                         NI_OPTS(netif).max_rx_packets)) ) {
-    LOG_U(log(LPF LNT_FMT" acceptq: lack of pkt bufs to promote synrecv (n=%d max=%d)",
-              LNT_PRI_ARGS(netif, tls), rx_n, max_rx_n));
+      ( ci_netif_pkt_rx_n(netif) + NI_OPTS(netif).endpoint_packet_reserve >=
+        NI_OPTS(netif).max_rx_packets ||
+        ci_netif_pkt_free_n(netif) <=
+        NI_OPTS(netif).endpoint_packet_reserve ) ) {
+    LOG_U(log(LPF LNT_FMT" acceptq: lack of pkt bufs to promote synrecv "
+              "(n=%d max=%d free=%d reserve=%d)",
+              LNT_PRI_ARGS(netif, tls), ci_netif_pkt_rx_n(netif),
+              NI_OPTS(netif).max_rx_packets, ci_netif_pkt_free_n(netif),
+              NI_OPTS(netif).endpoint_packet_reserve));
     CI_TCP_EXT_STATS_INC_LISTEN_NO_PKTS(netif);
     CITP_STATS_TCP_LISTEN(++tls->stats.n_acceptq_no_pkts);
     return -ENOMEM;
@@ -828,17 +831,15 @@ int ci_tcp_listenq_try_promote(ci_netif* netif, ci_tcp_socket_listen* tls,
         return rc;
       }
 
-      /* Remove fd from global fd_states list and push it to listen-socket's
-       * fd_states list in scalable case.
+      /* Remove fd from global fd_states list in scalable case to avoid
+       * possible stack lock.
        */
       if( scalable ) {
         ci_assert(ci_netif_is_locked(netif));
         ci_ni_dllist_remove_safe(netif, &ts->epcache_fd_link);
-        ci_ni_dllist_concurrent_push(netif, &tls->epcache.fd_states,
-                                     &ts->epcache_fd_link);
 
-        LOG_EP(ci_log(LPF LNT_FMT" acceptq: move fd %d from global fd_states"
-                      " list to listen-socket's list", LNT_PRI_ARGS(netif, tls),
+        LOG_EP(ci_log(LPF LNT_FMT" acceptq: remove fd %d from global"
+                      " fd_states list", LNT_PRI_ARGS(netif, tls),
                       ts->cached_on_fd));
       }
 

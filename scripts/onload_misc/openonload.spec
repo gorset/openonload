@@ -39,7 +39,7 @@
 #    --define "build_profile <profile>"
 
 
-%define pkgversion 7.1.0.265
+%define pkgversion 7.1.1.75
 
 %{!?kernel:  %{expand: %%define kernel %%(uname -r)}}
 %{!?target_cpu:  %{expand: %%define target_cpu %{_host_cpu}}}

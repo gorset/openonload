@@ -42,10 +42,10 @@
 #if defined(EFX_USE_KCOMPAT) && defined(EFX_HAVE_PCI_AER)
 #include <linux/aer.h>
 #endif
-#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_NDO_ADD_VXLAN_PORT) || defined(EFX_HAVE_NDO_UDP_TUNNEL_ADD)
+#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_NDO_ADD_VXLAN_PORT) || defined(EFX_HAVE_NDO_UDP_TUNNEL_ADD) || defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
 #include <net/gre.h>
 #endif
-#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_NDO_UDP_TUNNEL_ADD)
+#if defined(EFX_USE_KCOMPAT) && defined(EFX_HAVE_NDO_UDP_TUNNEL_ADD)
 #include <net/udp_tunnel.h>
 #endif
 #include "debugfs.h"
@@ -127,7 +127,6 @@ const char *const efx_reset_type_names[] = {
 	[RESET_TYPE_ALL]                = "ALL",
 	[RESET_TYPE_RECOVER_OR_ALL]     = "RECOVER_OR_ALL",
 	[RESET_TYPE_WORLD]              = "WORLD",
-	[RESET_TYPE_RECOVER_OR_DISABLE] = "RECOVER_OR_DISABLE",
 	[RESET_TYPE_DATAPATH]           = "DATAPATH",
 	[RESET_TYPE_MC_BIST]		= "MC_BIST",
 	[RESET_TYPE_DISABLE]            = "DISABLE",
@@ -1034,7 +1033,8 @@ static int efx_start_datapath(struct efx_nic *efx)
 #if !defined(EFX_NOT_UPSTREAM) || defined(EFX_RX_PAGE_SHARE)
 		BUILD_BUG_ON(sizeof(struct efx_rx_page_state) +
 			     2 * ALIGN(NET_IP_ALIGN + EFX_RX_USR_BUF_SIZE,
-				       EFX_RX_BUF_ALIGNMENT) >
+				       EFX_RX_BUF_ALIGNMENT) +
+			     XDP_PACKET_HEADROOM >
 			     PAGE_SIZE);
 #endif
 		efx->rx_scatter = true;
@@ -1197,7 +1197,7 @@ static void efx_stop_datapath(struct efx_nic *efx)
 		} else {
 			netif_err(efx, drv, efx->net_dev,
 				  "Recover or disable due to flush queue failure\n");
-			efx_schedule_reset(efx, RESET_TYPE_RECOVER_OR_DISABLE);
+			efx_schedule_reset(efx, RESET_TYPE_RECOVER_OR_ALL);
 		}
 	} else {
 		netif_dbg(efx, drv, efx->net_dev,
@@ -4013,7 +4013,7 @@ static int efx_get_phys_port_name(struct net_device *net_dev,
  */
 static bool efx_can_encap_offloads(struct efx_nic *efx, struct sk_buff *skb)
 {
-#if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_NDO_ADD_VXLAN_PORT) && !defined(EFX_HAVE_NDO_UDP_TUNNEL_ADD)
+#if defined(EFX_USE_KCOMPAT) && !defined(EFX_HAVE_NDO_ADD_VXLAN_PORT) && !defined(EFX_HAVE_NDO_UDP_TUNNEL_ADD) && !defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
 	return false;
 #else
 	struct gre_base_hdr *greh;
@@ -4180,7 +4180,8 @@ void efx_vlan_rx_register(struct net_device *dev, struct vlan_group *vlan_group)
 
 #endif /* EFX_NOT_UPSTREAM */
 
-#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_NDO_UDP_TUNNEL_ADD)
+#if defined(EFX_USE_KCOMPAT)
+#if defined(EFX_HAVE_NDO_UDP_TUNNEL_ADD) && !defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
 static int efx_udp_tunnel_type_map(enum udp_parsable_tunnel_type in)
 {
 	switch (in) {
@@ -4274,6 +4275,7 @@ void efx_geneve_del_port(struct net_device *dev, sa_family_t sa_family,
 }
 #endif
 #endif
+#endif
 
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_XDP)
 static int efx_xdp_setup_prog(struct efx_nic *efx, struct bpf_prog *prog)
@@ -4300,11 +4302,14 @@ static int efx_xdp_setup_prog(struct efx_nic *efx, struct bpf_prog *prog)
 static int efx_xdp(struct net_device *dev, struct netdev_bpf *xdp)
 {
 	struct efx_nic *efx = netdev_priv(dev);
+#if defined(EFX_USE_KCOMPAT) && defined(EFX_HAVE_XDP_QUERY_PROG)
 	struct bpf_prog *xdp_prog;
+#endif
 
 	switch (xdp->command) {
 	case XDP_SETUP_PROG:
 		return efx_xdp_setup_prog(efx, xdp->prog);
+#if defined(EFX_USE_KCOMPAT) && defined(EFX_HAVE_XDP_QUERY_PROG)
 	case XDP_QUERY_PROG:
 		xdp_prog = rtnl_dereference(efx->xdp_prog);
 #if defined(EFX_USE_KCOMPAT) && (defined(EFX_HAVE_XDP_PROG_ATTACHED) || defined(EFX_HAVE_XDP_OLD))
@@ -4314,6 +4319,7 @@ static int efx_xdp(struct net_device *dev, struct netdev_bpf *xdp)
 		xdp->prog_id = xdp_prog ? xdp_prog->aux->id : 0;
 #endif
 		return 0;
+#endif
 	default:
 		return -EINVAL;
 	}
@@ -4848,8 +4854,7 @@ out:
 
 	/* Leave device stopped if necessary */
 	disabled = (rc && !retry) ||
-		method == RESET_TYPE_DISABLE ||
-		method == RESET_TYPE_RECOVER_OR_DISABLE;
+		method == RESET_TYPE_DISABLE;
 
 	rc2 = efx_reset_up(efx, method, !disabled && !retry);
 	if (rc2) {
@@ -4948,8 +4953,7 @@ static void efx_reset_work(struct work_struct *data)
 	if (method == RESET_TYPE_MC_BIST)
 		efx_wait_for_bist_end(efx);
 
-	if ((method == RESET_TYPE_RECOVER_OR_DISABLE ||
-	     method == RESET_TYPE_RECOVER_OR_ALL) &&
+	if (method == RESET_TYPE_RECOVER_OR_ALL &&
 	    efx_try_recovery(efx))
 		return;
 
@@ -4987,7 +4991,6 @@ void efx_schedule_reset(struct efx_nic *efx, enum reset_type type)
 	case RESET_TYPE_RECOVER_OR_ALL:
 	case RESET_TYPE_WORLD:
 	case RESET_TYPE_DISABLE:
-	case RESET_TYPE_RECOVER_OR_DISABLE:
 	case RESET_TYPE_DATAPATH:
 	case RESET_TYPE_MC_BIST:
 	case RESET_TYPE_MCDI_TIMEOUT:
@@ -5221,8 +5224,10 @@ static int efx_init_struct(struct efx_nic *efx,
 
 fail1:
 	efx_fini_struct(efx);
+#ifdef CONFIG_SFC_MTD
 fail:
 	efx_mtd_free(efx);
+#endif
 	return -ENOMEM;
 }
 
@@ -5244,10 +5249,6 @@ static void efx_fini_struct(struct efx_nic *efx)
 #ifdef CONFIG_SFC_DEBUGFS
 	mutex_destroy(&efx->debugfs_symlink_mutex);
 #endif
-	if (efx->mtd_struct) {
-		efx->mtd_struct->efx = NULL;
-		efx->mtd_struct = NULL;
-	}
 }
 
 void efx_update_sw_stats(struct efx_nic *efx, u64 *stats)
@@ -5997,6 +5998,8 @@ static int efx_pm_freeze(struct device *dev)
 		efx_disable_interrupts(efx);
 
 		efx->state = STATE_UNINIT;
+
+		efx_mcdi_port_reconfigure(efx);
 	}
 
 	rtnl_unlock();
@@ -6036,6 +6039,8 @@ static int efx_pm_thaw(struct device *dev)
 		efx_device_attach_if_not_resetting(efx);
 
 		efx->state = STATE_READY;
+
+		efx_mcdi_port_reconfigure(efx);
 
 		efx->type->resume_wol(efx);
 	}
@@ -6172,7 +6177,7 @@ static int efx_pm_old_resume(struct pci_dev *dev)
  * Stop the software path and request a slot reset.
  */
 static pci_ers_result_t efx_io_error_detected(struct pci_dev *pdev,
-					      enum pci_channel_state state)
+					      pci_channel_state_t state)
 {
 	pci_ers_result_t status = PCI_ERS_RESULT_RECOVERED;
 	struct efx_nic *efx = pci_get_drvdata(pdev);
@@ -6219,10 +6224,10 @@ static pci_ers_result_t efx_io_slot_reset(struct pci_dev *pdev)
 		status =  PCI_ERS_RESULT_DISCONNECT;
 	}
 
-	rc = pci_cleanup_aer_uncorrect_error_status(pdev);
+	rc = pci_aer_clear_nonfatal_status(pdev);
 	if (rc) {
 		netif_err(efx, hw, efx->net_dev,
-		"pci_cleanup_aer_uncorrect_error_status failed (%d)\n", rc);
+		"pci_aer_clear_nonfatal_status failed (%d)\n", rc);
 		/* Non-fatal error. Continue. */
 	}
 
@@ -6390,10 +6395,15 @@ const struct net_device_ops efx_netdev_ops = {
 #endif
 #endif
 
-#if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_NDO_UDP_TUNNEL_ADD)
+#if defined(EFX_USE_KCOMPAT)
+#if defined(EFX_HAVE_NDO_UDP_TUNNEL_ADD)
+#if defined(EFX_HAVE_UDP_TUNNEL_NIC_INFO)
+	.ndo_udp_tunnel_add	= udp_tunnel_nic_add_port,
+	.ndo_udp_tunnel_del	= udp_tunnel_nic_del_port,
+#else
 	.ndo_udp_tunnel_add	= efx_udp_tunnel_add,
 	.ndo_udp_tunnel_del	= efx_udp_tunnel_del,
-#else
+#endif
 #if defined(EFX_HAVE_NDO_ADD_VXLAN_PORT)
 	.ndo_add_vxlan_port	= efx_vxlan_add_port,
 	.ndo_del_vxlan_port	= efx_vxlan_del_port,
@@ -6401,6 +6411,7 @@ const struct net_device_ops efx_netdev_ops = {
 #if defined(EFX_HAVE_NDO_ADD_GENEVE_PORT)
 	.ndo_add_geneve_port	= efx_geneve_add_port,
 	.ndo_del_geneve_port	= efx_geneve_del_port,
+#endif
 #endif
 #endif
 #if !defined(EFX_USE_KCOMPAT) || defined(EFX_HAVE_XDP)

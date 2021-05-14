@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/* X-SPDX-Copyright-Text: (c) Solarflare Communications Inc */
+/* SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause */
+/* X-SPDX-Copyright-Text: (c) Copyright 2009-2020 Xilinx, Inc. */
 /**************************************************************************\
 *//*! \file
 ** <L5_PRIVATE L5_HEADER >
@@ -16,12 +16,12 @@
 
 
 #ifndef ONLOAD_VERSION
-# define ONLOAD_VERSION "7.1.0.265"
+# define ONLOAD_VERSION "7.1.1.75"
 #endif
 
 #define ONLOAD_PRODUCT "Onload"
 
-#define ONLOAD_COPYRIGHT "Copyright 2019-2020 Xilinx, 2006-2019 Solarflare Communications, 2002-2005 Level 5 Networks"
+#define ONLOAD_COPYRIGHT "Copyright 2019-2021 Xilinx, 2006-2019 Solarflare Communications, 2002-2005 Level 5 Networks"
 
 /* Max length of version string used for version skew checking. */
 enum { OO_VER_STR_LEN = 40 };

@@ -109,7 +109,7 @@ Documentation
 
    openonload/src/tests/ef_vi
 
- If you've any questions please contact <support@solarflare.com>.
+ If you've any questions please contact <support-nic@xilinx.com>.
 
 
 License
@@ -117,4 +117,4 @@ License
 
  ef_vi is released under the GNU Lesser General Public License -- see the
  LICENSE file for details.  If this license does not meet your needs,
- please contact us at <support@solarflare.com> to discuss other options.
+ please contact us at <support-nic@xilinx.com> to discuss other options.

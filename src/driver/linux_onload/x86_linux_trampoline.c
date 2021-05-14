@@ -34,6 +34,7 @@
  *
  *--------------------------------------------------------------------*/
 
+#include <ci/efrm/syscall.h>
 #include "onload_kernel_compat.h"
 
 #include <onload/linux_onload_internal.h>
@@ -142,7 +143,7 @@
    ptregs argument.
    (The user-space calling convention is the same as before, though).
 */
-#ifdef ONLOAD_SYSCALL_PTREGS
+#ifdef EFRM_SYSCALL_PTREGS
 #  define SYSCALL_PTR_DEF(_name, _args)                     \
   asmlinkage long (*_name)(const struct pt_regs *regs)
 #  define PASS_SYSCALL1(_name, _arg)                \
@@ -205,22 +206,6 @@
  */
 
 
-/* The address of the system call table.
- */
-static void **syscall_table = 0;
-
-/* The address of the syscall entry point. */
-static void *oo_entry_SYSCALL_64_addr = NULL;
-
-#ifdef CONFIG_COMPAT
-
-/* The address of the 32-bit compatibility system call table.
- */
-static void **ia32_syscall_table = 0;
-
-#endif
-
-
 /* We must save the original addresses of the routines we intercept.
  */
 static SYSCALL_PTR_DEF(saved_sys_close, (int));
@@ -238,189 +223,6 @@ static SYSCALL_PTR_DEF(saved_sys_exit_group32, (int));
 #endif
 
 atomic_t efab_syscall_used;
-
-
-/* Find the syscall table...
- */
-#if defined(CONFIG_X86_XEN)
-static void **find_syscall_table(void)
-{
-  /* We don't currently have any non-appalling way of doing this. */
-  return NULL;
-}
-
-#elif defined(__x86_64__)
-
-static void* oo_entry_sys_call_table(void)
-{
-  static void* res = NULL;
-
-  if( res != NULL )
-    return res;
-#ifdef ERFM_HAVE_NEW_KALLSYMS
-  /* It works with CONFIG_KALLSYMS_ALL=y only. */
-  res = efrm_find_ksym("sys_call_table");
-#endif
-  return res;
-}
-
-static void* oo_entry_SYSCALL_64(void)
-{
-  unsigned long result = 0;
-
-  if( oo_entry_SYSCALL_64_addr != NULL )
-    return oo_entry_SYSCALL_64_addr;
-
-  /* linux<4.2 does not define entry_SYSCALL_64().  It uses system_call(). */
-  rdmsrl(MSR_LSTAR, result);
-  oo_entry_SYSCALL_64_addr = (void*)result;
-  return oo_entry_SYSCALL_64_addr;
-}
-
-/* "old" kernels: find "call *table" to syscall table,
- * see the comment in find_syscall_table(). */
-static void **find_syscall_ind_call(unsigned char *p)
-{
-  unsigned long result = 0;
-  unsigned char *pend;
-
-  result = (unsigned long)p;
-  pend = p + 1024 - 7;
-  while (p < pend) {
-    if ((p[0] == 0xff) && (p[1] == 0x14) && (p[2] == 0xc5)) {
-      result &= ~ 0xffffffffUL;
-      result |= (p[3] | (p[4] << 8) | (p[5] << 16) | (p[6] << 24));
-      TRAMP_DEBUG("syscall table at %lx", result);
-      return (void **)result;
-    }
-    p++;
-  }
-  return NULL;
-}
-
-/* "new" kernels: find "movq sys_call_table",
- * see the comment in find_syscall_table().*/
-static void **find_syscall_movq(unsigned char *p)
-{
-  unsigned long result = 0;
-  unsigned char *pend;
-
-  result = (unsigned long)p;
-  pend = p + 1024 - 9;
-  while (p < pend) {
-    if ((p[0] == 0x48) && (p[1] == 0x8b) && (p[2] == 0x04) &&
-        (p[3] == 0xc5) && (p[8] == 0xe8)) {
-      result &= ~ 0xffffffffUL;
-      result |= (p[4] | (p[5] << 8) | (p[6] << 16) | (p[7] << 24));
-      TRAMP_DEBUG("syscall table at %lx", result);
-      return (void **)result;
-    }
-    p++;
-  }
-  return NULL;
-}
-
-static void **find_syscall_table(void)
-{
-  unsigned char *p;
-  void **result;
-
-  /* First see if it is in kallsyms */
-  p = oo_entry_sys_call_table();
-  if( p != NULL ) {
-    TRAMP_DEBUG("syscall table ksym at %p", (unsigned long*)p);
-    return (void**)p;
-  }
-
-  /* If kallsyms lookup failed, fall back to looking at some assembly
-   * code that we know references the syscall table.
-   * 
-   * For x86_64, we can find the syscall entry point directly from the
-   * LSTAR MSR.  The opcode we need to locate is either
-   * "call *table(,%rax,8)" which is 0xff,0x14,0xc5,<table>
-   * or (on some newewer kernels)
-   * "movq    sys_call_table(, %rax, 8), %rax" which is
-   * 0x48,0x8b,0x04,0xc5,<table>
-   * (but note that <table> here is only 4 bytes, not 8).
-   * In the latter case we also check for the next opcode to be call (0xe8),
-   * in order to avoid false positives.
-   */
-  p = oo_entry_SYSCALL_64();
-  if( p == NULL )
-    return NULL;
-
-  TRAMP_DEBUG("entry_SYSCALL_64=%p", p);
-  result = find_syscall_ind_call(p);
-  if (result != NULL)
-    return result;
-  result = find_syscall_movq(p);
-  if (result != NULL)
-    return result;
-  TRAMP_DEBUG("didn't find syscall table address");
-  return NULL;
-}
-
-#ifdef CONFIG_COMPAT
-/* We also need to find the ia32_syscall_table used by 32-bit apps in 64-bit
- * mode.  This can be found via int 0x80 in a similar way to x86 -- but the
- * IDTR and entries in it are larger here, and the instruction we're looking
- * for is "call *table(,%rax,8)" (as for the 64-bit syscall table).
- */
-static void **find_ia32_syscall_table(void)
-{
-  unsigned long result = 0;
-  unsigned char *p = NULL;
-  void **table;
-
-#ifdef ERFM_HAVE_NEW_KALLSYMS
-  /* It works with CONFIG_KALLSYMS_ALL=y only. */
-  /* Linux>=4.2: ia32_sys_call_table is not a local variable any more, so
-   * we can use kallsyms to find it if CONFIG_KALLSYMS_ALL=y. */
-  void *addr;
-  addr = efrm_find_ksym("ia32_sys_call_table");
-  if( addr != NULL )
-    return addr;
-
-  /* Linux-4.4 & 4.5: do_syscall_32_irqs_off is a function, so it does not
-   * require CONFIG_KALLSYMS_ALL=y. */
-  p = efrm_find_ksym("do_syscall_32_irqs_off");
-  /* Linux-4.6: */
-  if( p == NULL )
-    p = efrm_find_ksym("do_int80_syscall_32");
-#endif
-
-  if( p == NULL ) {
-    /* linux<4.4: get ia32_sys_call_table variable from asm code at
-     * linux/arch/x86/entry/entry_64_compat.S. */
-    unsigned int *idtbase;
-    unsigned char idt[10];
-
-    __asm__("sidt %0" : "=m"(idt));
-    idtbase = *(unsigned int **)(&idt[2]);
-    TRAMP_DEBUG("idt base=%p, entry 0x80=%08x,%08x,%08x", idtbase,
-                idtbase[0x80*4], idtbase[0x80*4+1], idtbase[0x80*4+2]);
-    result = (idtbase[0x80*4] & 0xffff) | (idtbase[0x80*4+1] & 0xffff0000)
-             | ((unsigned long)idtbase[0x80*4+2] << 32);
-    p = (unsigned char *)result;
-  }
-
-  TRAMP_DEBUG("int 0x80 entry point at %p", p);
-  table = find_syscall_ind_call(p);
-  if (table != NULL)
-    return table;
-  table = find_syscall_movq(p);
-  if (table != NULL)
-    return table;
-  ci_log("ERROR: didn't find ia32_sys_call_table address");
-
-  return NULL;
-}
-#endif
-
-#else
-#error "Don't know how to find syscall table on this platform"
-#endif
-
 
 /* A way to call the original sys_close, exported to other parts of the code.
  */
@@ -455,20 +257,20 @@ asmlinkage int efab_linux_sys_epoll_create1(int flags)
   SYSCALL_PTR_DEF(sys_epoll_create_fn, (int));
   int rc;
 
-  if( syscall_table == NULL ) {
+  if( efrm_syscall_table == NULL ) {
     ci_log("Unexpected epoll_ctl() request before full init");
     return -EFAULT;
   }
 
 #ifdef __NR_epoll_create1
-  sys_epoll_create_fn = syscall_table[__NR_epoll_create1];
+  sys_epoll_create_fn = efrm_syscall_table[__NR_epoll_create1];
   TRAMP_DEBUG ("epoll_create1(%d) via %p...", flags, sys_epoll_create_fn);
   rc = PASS_SYSCALL1(sys_epoll_create_fn, flags);
   if( rc != -ENOSYS )
     goto out;
   /* fallthrough to epoll_create */
 #endif
-  sys_epoll_create_fn = syscall_table[__NR_epoll_create];
+  sys_epoll_create_fn = efrm_syscall_table[__NR_epoll_create];
   TRAMP_DEBUG ("epoll_create via %p...", sys_epoll_create_fn);
   rc = PASS_SYSCALL1(sys_epoll_create_fn, 1);
   ci_assert_equal(flags & ~EPOLL_CLOEXEC, 0);
@@ -493,12 +295,12 @@ asmlinkage int efab_linux_sys_epoll_ctl(int epfd, int op, int fd,
   SYSCALL_PTR_DEF(sys_epoll_ctl_fn, (int, int, int, struct epoll_event *));
   int rc;
 
-  if( syscall_table == NULL ) {
+  if( efrm_syscall_table == NULL ) {
     ci_log("Unexpected epoll_ctl() request before full init");
     return -EFAULT;
   }
 
-  sys_epoll_ctl_fn = syscall_table[__NR_epoll_ctl];
+  sys_epoll_ctl_fn = efrm_syscall_table[__NR_epoll_ctl];
   TRAMP_DEBUG ("epoll_ctl(%d,%d,%d,%p) via %p...", epfd, op, fd, event,
                sys_epoll_ctl_fn);
   rc = PASS_SYSCALL4(sys_epoll_ctl_fn, epfd, op, fd, event);
@@ -511,12 +313,12 @@ asmlinkage int efab_linux_sys_epoll_wait(int epfd, struct epoll_event *events,
   SYSCALL_PTR_DEF(sys_epoll_wait_fn, (int, struct epoll_event *, int, int));
   int rc;
 
-  if( syscall_table == NULL ) {
+  if( efrm_syscall_table == NULL ) {
     ci_log("Unexpected epoll_wait() request before full init");
     return -EFAULT;
   }
 
-  sys_epoll_wait_fn = syscall_table[__NR_epoll_wait];
+  sys_epoll_wait_fn = efrm_syscall_table[__NR_epoll_wait];
   TRAMP_DEBUG ("epoll_wait(%d,%p,%d,%d) via %p...", epfd, events, maxevents,
                timeout, sys_epoll_wait_fn);
   rc = PASS_SYSCALL4(sys_epoll_wait_fn, epfd, events, maxevents, timeout);
@@ -532,7 +334,7 @@ asmlinkage int efab_linux_sys_sendmsg(int fd, struct msghdr __user* msg,
 {
   int rc;
 
-  if( syscall_table == NULL ) {
+  if( efrm_syscall_table == NULL ) {
     ci_log("Unexpected sendmsg() request before full init");
     return -EFAULT;
   }
@@ -541,14 +343,14 @@ asmlinkage int efab_linux_sys_sendmsg(int fd, struct msghdr __user* msg,
 #ifdef __NR_sendmsg
     SYSCALL_PTR_DEF(sys_sendmsg_fn, (int, struct msghdr *, unsigned));
 
-    sys_sendmsg_fn = syscall_table[__NR_sendmsg];
+    sys_sendmsg_fn = efrm_syscall_table[__NR_sendmsg];
     TRAMP_DEBUG ("sendmsg(%d,%p,%d) via %p...", fd, msg, flags, sys_sendmsg_fn);
     rc = PASS_SYSCALL3(sys_sendmsg_fn, fd, msg, flags);
 #elif defined(__NR_socketcall)
     SYSCALL_PTR_DEF(sys_socketcall_fn, (int, unsigned long *));
     unsigned long args[3];
 
-    sys_socketcall_fn = syscall_table[__NR_socketcall];
+    sys_socketcall_fn = efrm_syscall_table[__NR_socketcall];
     TRAMP_DEBUG ("sendmsg(%d,%p,%d) via %p...", fd, msg,
                  flags, sys_socketcall_fn);
     memset(args, 0, sizeof(args));
@@ -572,7 +374,7 @@ asmlinkage int efab_linux_sys_bpf(int cmd, union bpf_attr __user* attr,
 {
   int rc;
 
-  if( syscall_table == NULL ) {
+  if( efrm_syscall_table == NULL ) {
     ci_log("Unexpected bpf() request before full init");
     return -EFAULT;
   }
@@ -581,7 +383,7 @@ asmlinkage int efab_linux_sys_bpf(int cmd, union bpf_attr __user* attr,
 #ifdef __NR_bpf
     SYSCALL_PTR_DEF(sys_bpf_fn, (int, union bpf_attr *, int));
 
-    sys_bpf_fn = syscall_table[__NR_bpf];
+    sys_bpf_fn = efrm_syscall_table[__NR_bpf];
     TRAMP_DEBUG ("bpf(%d,%p,%d) via %p...", cmd, attr, size, sys_bpf_fn);
     rc = PASS_SYSCALL3(sys_bpf_fn, cmd, attr, size);
 #else
@@ -604,16 +406,16 @@ efab_linux_sys_sendmsg32(int fd, struct compat_msghdr __user* msg,
 {
   int rc;
 
-  if( syscall_table == NULL ) {
+  if( efrm_syscall_table == NULL ) {
     ci_log("Unexpected sendmsg() request before full init");
     return -EFAULT;
   }
 
-  if( ia32_syscall_table != NULL ) {
+  if( efrm_compat_syscall_table != NULL ) {
     SYSCALL_PTR_DEF(sys_socketcall_fn, (int, unsigned long *));
     compat_ulong_t args[3];
 
-    sys_socketcall_fn = ia32_syscall_table[102/*__NR_socketcall*/];
+    sys_socketcall_fn = efrm_compat_syscall_table[102/*__NR_socketcall*/];
     TRAMP_DEBUG ("sendmsg32(%d,%p,%d) via %p...", fd, msg,
                  flags, sys_socketcall_fn);
     memset(args, 0, sizeof(args));
@@ -719,7 +521,7 @@ ci_inline unsigned long *get_oldrsp_addr(void)
     unsigned long kernel_stack_p = (unsigned long) percpu_p(OO_KERNEL_STACK);
     unsigned char *p_end;
 
-    p = oo_entry_SYSCALL_64();
+    p = efrm_entry_SYSCALL_64_addr;
 #ifndef NDEBUG
     ptr = p;
 #define OOPS(msg) { \
@@ -793,7 +595,7 @@ avoid_sysret(void)
   set_thread_flag (TIF_NEED_RESCHED);
 }
 
-#ifndef ONLOAD_SYSCALL_PTREGS
+#ifndef EFRM_SYSCALL_PTREGS
 /* There are 2 ways to enter syscall: int80 and vsyscall page.
  * We'll store offsets for 2 different stack layouts. */
 #define TRAMP_PRESAVED_OFF32 2
@@ -847,7 +649,7 @@ tramp_close_begin(int fd, ci_uintptr_t *tramp_entry_out,
 }
 
 
-#ifndef ONLOAD_SYSCALL_PTREGS
+#ifndef EFRM_SYSCALL_PTREGS
 #ifndef NDEBUG
 /* Heuristic for deciding whether a struct pt_regs looks valid. */
 static inline int /* bool */
@@ -886,7 +688,7 @@ looks_like_pt_regs64(const struct pt_regs* regs, unsigned long syscall_num)
 #endif
 
 asmlinkage long
-#ifndef ONLOAD_SYSCALL_PTREGS
+#ifndef EFRM_SYSCALL_PTREGS
 efab_linux_trampoline_handler_close64(int fd)
 #else
 /* The argument is defined as const pointer in the kernel,
@@ -898,7 +700,7 @@ efab_linux_trampoline_handler_close64(struct pt_regs *regs)
   ci_uintptr_t trampoline_entry = 0;
   ci_uintptr_t trampoline_exclude = 0;
   unsigned long *user_sp =0;
-#ifndef ONLOAD_SYSCALL_PTREGS
+#ifndef EFRM_SYSCALL_PTREGS
   struct pt_regs* regs;
   char* stack_end = (char*) percpu_read_from_p(percpu_p(OO_KERNEL_STACK)) +
                     OO_KERNEL_STACK_END_OFFSET;
@@ -909,7 +711,7 @@ efab_linux_trampoline_handler_close64(struct pt_regs *regs)
   if( tramp_close_begin(fd, &trampoline_entry, &trampoline_exclude) )
     return tramp_close_passthrough(fd);
 
-#ifndef ONLOAD_SYSCALL_PTREGS
+#ifndef EFRM_SYSCALL_PTREGS
   TRAMP_DEBUG("kernel stack is %p (after adding offset %lu)", stack_end,
               OO_KERNEL_STACK_END_OFFSET);
   /* The struct pt_regs should end at the end of the stack.  Move to the start
@@ -1043,7 +845,7 @@ efab_linux_trampoline_handler_close64(struct pt_regs *regs)
 
 #ifdef CONFIG_COMPAT
 
-#ifndef ONLOAD_SYSCALL_PTREGS
+#ifndef EFRM_SYSCALL_PTREGS
 /* Find struct pt_regs on the stack using the stack base pointer and four known
  * registers.  RHEL 7 backports of CONFIG_RETPOLINE changed the syscall entry
  * paths.  Now, on these kernels, the struct pt_regs is not always at the
@@ -1097,7 +899,7 @@ tramp_stack_find_regs32(unsigned long cx, unsigned long dx, unsigned long si,
 }
 #endif
 
-#ifndef ONLOAD_SYSCALL_PTREGS
+#ifndef EFRM_SYSCALL_PTREGS
 extern asmlinkage int
 efab_linux_trampoline_handler_close32(unsigned long bx, unsigned long cx,
                                       unsigned long dx, unsigned long si,
@@ -1111,7 +913,7 @@ efab_linux_trampoline_handler_close32(struct pt_regs *regs)
   ci_uintptr_t trampoline_entry = 0;
   ci_uintptr_t trampoline_exclude = 0;
   unsigned int *user32_sp =0;
-#ifdef ONLOAD_SYSCALL_PTREGS
+#ifdef EFRM_SYSCALL_PTREGS
   unsigned long bx = regs->bx;
 #endif
 
@@ -1122,7 +924,7 @@ efab_linux_trampoline_handler_close32(struct pt_regs *regs)
   /* Let's trampoline! */
   ci_assert (sizeof *user32_sp == 4);
 
-#ifndef ONLOAD_SYSCALL_PTREGS
+#ifndef EFRM_SYSCALL_PTREGS
   regs = tramp_stack_find_regs32(cx, dx, si, di, (void *)regs);
   if( regs == NULL )
     return tramp_close_passthrough(bx);
@@ -1219,9 +1021,9 @@ asmlinkage int efab_linux_sys_shmget(key_t key, size_t size, int shmflg)
   SYSCALL_PTR_DEF(sys_shmget_fn, (key_t, size_t, int));
   int rc;
 
-  ci_assert(syscall_table);
+  ci_assert(efrm_syscall_table);
 
-  sys_shmget_fn = syscall_table[__NR_shmget];
+  sys_shmget_fn = efrm_syscall_table[__NR_shmget];
   TRAMP_DEBUG ("shmget(%d,%ld,%d) via %p...", key, size, shmflg,
                sys_shmget_fn);
   rc = PASS_SYSCALL3(sys_shmget_fn, key, size, shmflg);
@@ -1233,9 +1035,9 @@ asmlinkage long efab_linux_sys_shmat(int shmid, char __user *addr, int shmflg)
   SYSCALL_PTR_DEF(sys_shmat_fn, (int, char __user *, int));
   long rc;
 
-  ci_assert(syscall_table);
+  ci_assert(efrm_syscall_table);
 
-  sys_shmat_fn = syscall_table[__NR_shmat];
+  sys_shmat_fn = efrm_syscall_table[__NR_shmat];
   TRAMP_DEBUG ("shmat(%d,%p,%d) via %p...", shmid, addr, shmflg,
                sys_shmat_fn);
   rc = PASS_SYSCALL3(sys_shmat_fn, shmid, addr, shmflg);
@@ -1247,9 +1049,9 @@ asmlinkage int efab_linux_sys_shmdt(char __user *addr)
   SYSCALL_PTR_DEF(sys_shmdt_fn, (char __user *));
   int rc;
 
-  ci_assert(syscall_table);
+  ci_assert(efrm_syscall_table);
 
-  sys_shmdt_fn = syscall_table[__NR_shmdt];
+  sys_shmdt_fn = efrm_syscall_table[__NR_shmdt];
   TRAMP_DEBUG ("shmdt(%p) via %p...", addr, sys_shmdt_fn);
   rc = PASS_SYSCALL1(sys_shmdt_fn, addr);
   TRAMP_DEBUG ("... = %d", rc);
@@ -1260,9 +1062,9 @@ asmlinkage int efab_linux_sys_shmctl(int shmid, int cmd, struct shmid_ds __user 
   SYSCALL_PTR_DEF(sys_shmctl_fn, (int, int, struct shmid_ds __user *));
   int rc;
 
-  ci_assert(syscall_table);
+  ci_assert(efrm_syscall_table);
 
-  sys_shmctl_fn = syscall_table[__NR_shmctl];
+  sys_shmctl_fn = efrm_syscall_table[__NR_shmctl];
   TRAMP_DEBUG ("shmdt(%d,%d,%p) via %p...", shmid, cmd, buf, sys_shmctl_fn);
   rc = PASS_SYSCALL3(sys_shmctl_fn, shmid, cmd, buf);
   TRAMP_DEBUG ("... = %d", rc);
@@ -1314,113 +1116,106 @@ patch_syscall_table (void **table, unsigned entry, void *func,
  */
 int efab_linux_trampoline_ctor(int no_sct)
 {
-  syscall_table = find_syscall_table();
+  ci_assert(efrm_syscall_table);
 
   atomic_set(&efab_syscall_used, 0);
-  if (syscall_table) {
-    /* We really have to hope that syscall_table was found correctly.  There
+  if (efrm_syscall_table) {
+    /* We really have to hope that efrm_syscall_table was found correctly.  There
      * is no reliable way to check it (e.g. by looking at the contents) which
      * will work on all platforms...
      */
-    TRAMP_DEBUG("syscall_table=%p: close=%p exit_group=%p, rt_sigaction=%p",
-                syscall_table, syscall_table[__NR_close],
-                syscall_table[__NR_exit_group],
-                syscall_table[__NR_rt_sigaction]);
+    TRAMP_DEBUG("efrm_syscall_table=%p: close=%p exit_group=%p, rt_sigaction=%p",
+                efrm_syscall_table, efrm_syscall_table[__NR_close],
+                efrm_syscall_table[__NR_exit_group],
+                efrm_syscall_table[__NR_rt_sigaction]);
 
     efab_linux_termination_ctor();
 
-    saved_sys_close = syscall_table [__NR_close];
-    saved_sys_exit_group = syscall_table [__NR_exit_group];
-    saved_sys_rt_sigaction = syscall_table [__NR_rt_sigaction];
+    saved_sys_close = efrm_syscall_table [__NR_close];
+    saved_sys_exit_group = efrm_syscall_table [__NR_exit_group];
+    saved_sys_rt_sigaction = efrm_syscall_table [__NR_rt_sigaction];
 
     ci_mb();
     if (no_sct) {
       TRAMP_DEBUG("syscalls NOT hooked - no_sct requested");
     } else {
-      patch_syscall_table (syscall_table, __NR_close,
+      patch_syscall_table (efrm_syscall_table, __NR_close,
                            efab_linux_trampoline_close, saved_sys_close);
       if( safe_signals_and_exit ) {
-        patch_syscall_table (syscall_table, __NR_exit_group,
+        patch_syscall_table (efrm_syscall_table, __NR_exit_group,
                              efab_linux_trampoline_exit_group,
                              saved_sys_exit_group);
-        patch_syscall_table (syscall_table, __NR_rt_sigaction,
+        patch_syscall_table (efrm_syscall_table, __NR_rt_sigaction,
                              efab_linux_trampoline_sigaction,
                              saved_sys_rt_sigaction);
       }
       TRAMP_DEBUG("syscalls hooked: close=%p exit_group=%p, rt_sigaction=%p",
-                  syscall_table[__NR_close], syscall_table[__NR_exit_group],
-                  syscall_table[__NR_rt_sigaction]);
+                  efrm_syscall_table[__NR_close], efrm_syscall_table[__NR_exit_group],
+                  efrm_syscall_table[__NR_rt_sigaction]);
     }
   } else {
-    /* syscall_table wasn't found, so we may have no way to sys_close()... */
+    /* efrm_syscall_table wasn't found, so we may have no way to sys_close()... */
     OO_DEBUG_ERR(ci_log("ERROR: syscall table not found"));
     return -ENOEXEC;
   }
 
-#ifdef ERFM_HAVE_NEW_KALLSYMS
-  oo_entry_SYSCALL_64_addr = efrm_find_ksym("entry_SYSCALL_64");
-#endif
-
 #ifdef CONFIG_COMPAT
-
-  ia32_syscall_table = find_ia32_syscall_table();
-
-  if (ia32_syscall_table && !no_sct) {
+  if (efrm_compat_syscall_table && !no_sct) {
     /* On pre-4.17 kernels we can do a sanity check on the
-     * ia32_syscall_table value: sys_close is the same for both
+     * efrm_compat_syscall_table value: sys_close is the same for both
      * 64-bit and 32-bit, so the current entry for sys_close
      * in the 32-bit table should match the original value from the 64-bit
      * table, which we've saved in saved_sys_close in the code above.
      * For post-4.17 kernels with a new calling convention, the 32-bit entry
      * stub will be different, so no sensible check is possible here
      */
-#ifndef ONLOAD_SYSCALL_PTREGS
-#define CHECK_ENTRY(_n, _ptr) (ia32_syscall_table[_n] == (_ptr))
+#ifndef EFRM_SYSCALL_PTREGS
+#define CHECK_ENTRY(_n, _ptr) (efrm_compat_syscall_table[_n] == (_ptr))
 #else
 #define CHECK_ENTRY(_n, _ptr) 1
 #endif
-    TRAMP_DEBUG("ia32_syscall_table=%p: close=%p, exit_group=%p, "
-                "rt_sigaction=%p", ia32_syscall_table,
-                ia32_syscall_table[__NR_ia32_close],
-                ia32_syscall_table[__NR_ia32_exit_group],
-                ia32_syscall_table[__NR_ia32_rt_sigaction]);
-    saved_sys_rt_sigaction32 = ia32_syscall_table[__NR_ia32_rt_sigaction];
-    saved_sys_close32 = ia32_syscall_table[__NR_ia32_close];
-    saved_sys_exit_group32 = ia32_syscall_table[__NR_ia32_exit_group];
+    TRAMP_DEBUG("efrm_compat_syscall_table=%p: close=%p, exit_group=%p, "
+                "rt_sigaction=%p", efrm_compat_syscall_table,
+                efrm_compat_syscall_table[__NR_ia32_close],
+                efrm_compat_syscall_table[__NR_ia32_exit_group],
+                efrm_compat_syscall_table[__NR_ia32_rt_sigaction]);
+    saved_sys_rt_sigaction32 = efrm_compat_syscall_table[__NR_ia32_rt_sigaction];
+    saved_sys_close32 = efrm_compat_syscall_table[__NR_ia32_close];
+    saved_sys_exit_group32 = efrm_compat_syscall_table[__NR_ia32_exit_group];
     ci_mb();
 
     if (CHECK_ENTRY(__NR_ia32_close, saved_sys_close)) {
-      patch_syscall_table (ia32_syscall_table, __NR_ia32_close,
+      patch_syscall_table (efrm_compat_syscall_table, __NR_ia32_close,
                            efab_linux_trampoline_close32,
                            saved_sys_close32);
     } else {
       TRAMP_DEBUG("expected ia32 sys_close=%p, but got %p", saved_sys_close,
-                  ia32_syscall_table[__NR_ia32_close]);
+                  efrm_compat_syscall_table[__NR_ia32_close]);
       ci_log("ia32 close syscall NOT hooked");
     }
     if( safe_signals_and_exit &&
         CHECK_ENTRY(__NR_ia32_exit_group, saved_sys_exit_group)) {
-#ifndef ONLOAD_SYSCALL_PTREGS
-      ci_assert_equal(ia32_syscall_table[__NR_ia32_exit_group],
+#ifndef EFRM_SYSCALL_PTREGS
+      ci_assert_equal(efrm_compat_syscall_table[__NR_ia32_exit_group],
                       saved_sys_exit_group);
 #endif
-      patch_syscall_table (ia32_syscall_table, __NR_ia32_exit_group,
+      patch_syscall_table (efrm_compat_syscall_table, __NR_ia32_exit_group,
                            efab_linux_trampoline_exit_group,
                            saved_sys_exit_group32);
-      patch_syscall_table (ia32_syscall_table, __NR_ia32_rt_sigaction,
+      patch_syscall_table (efrm_compat_syscall_table, __NR_ia32_rt_sigaction,
                            efab_linux_trampoline_sigaction32,
                            saved_sys_rt_sigaction32);
     } else {
       TRAMP_DEBUG("expected ia32 sys_exit_group=%p, but got %p",
                   saved_sys_exit_group,
-                  ia32_syscall_table[__NR_ia32_exit_group]);
+                  efrm_compat_syscall_table[__NR_ia32_exit_group]);
       ci_log("ia32 exit_group syscall NOT hooked");
     }
     TRAMP_DEBUG("ia32 syscalls hooked: close=%p, exit_group=%p, "
                 "rt_sigaction=%p",
-                ia32_syscall_table[__NR_ia32_close],
-                ia32_syscall_table[__NR_ia32_exit_group],
-                ia32_syscall_table[__NR_ia32_rt_sigaction]);
+                efrm_compat_syscall_table[__NR_ia32_close],
+                efrm_compat_syscall_table[__NR_ia32_exit_group],
+                efrm_compat_syscall_table[__NR_ia32_rt_sigaction]);
   }
 #undef CHECK_ENTRY
 #endif
@@ -1464,22 +1259,22 @@ void wait_for_other_syscall_callers(void)
 
 int
 efab_linux_trampoline_dtor (int no_sct) {
-  if (syscall_table != NULL && !no_sct) {
+  if (efrm_syscall_table != NULL && !no_sct) {
     int waiting = 0;
 
     /* Restore the system-call table to its proper state */
-    patch_syscall_table (syscall_table, __NR_close, saved_sys_close,
+    patch_syscall_table (efrm_syscall_table, __NR_close, saved_sys_close,
                          efab_linux_trampoline_close);
     if( safe_signals_and_exit ) {
-      patch_syscall_table (syscall_table, __NR_exit_group, saved_sys_exit_group,
+      patch_syscall_table (efrm_syscall_table, __NR_exit_group, saved_sys_exit_group,
                            efab_linux_trampoline_exit_group);
-      patch_syscall_table (syscall_table, __NR_rt_sigaction,
+      patch_syscall_table (efrm_syscall_table, __NR_rt_sigaction,
                            saved_sys_rt_sigaction,
                            efab_linux_trampoline_sigaction);
     }
     TRAMP_DEBUG("syscalls restored: close=%p, exit_group=%p, rt_sigaction=%p",
-                syscall_table[__NR_close], syscall_table[__NR_exit_group],
-                syscall_table[__NR_rt_sigaction]);
+                efrm_syscall_table[__NR_close], efrm_syscall_table[__NR_exit_group],
+                efrm_syscall_table[__NR_rt_sigaction]);
 
     /* If anybody have already entered our syscall handlers, he should get
      * to efab_syscall_used++ now: let's wait a bit. */
@@ -1500,23 +1295,23 @@ efab_linux_trampoline_dtor (int no_sct) {
   }
 
 #ifdef CONFIG_COMPAT
-  if (ia32_syscall_table != NULL && !no_sct) {
+  if (efrm_compat_syscall_table != NULL && !no_sct) {
     /* Restore the ia32 system-call table to its proper state */
-    patch_syscall_table (ia32_syscall_table,  __NR_ia32_close,
+    patch_syscall_table (efrm_compat_syscall_table,  __NR_ia32_close,
                          saved_sys_close32, efab_linux_trampoline_close32);
     if( safe_signals_and_exit ) {
-      patch_syscall_table (ia32_syscall_table, __NR_ia32_exit_group,
+      patch_syscall_table (efrm_compat_syscall_table, __NR_ia32_exit_group,
                            saved_sys_exit_group32,
                            efab_linux_trampoline_exit_group);
-      patch_syscall_table (ia32_syscall_table, __NR_ia32_rt_sigaction,
+      patch_syscall_table (efrm_compat_syscall_table, __NR_ia32_rt_sigaction,
                            saved_sys_rt_sigaction32,
                            efab_linux_trampoline_sigaction32);
     }
     TRAMP_DEBUG("ia32 syscalls restored: close=%p, exit_group=%p, "
                 "rt_sigaction=%p",
-                ia32_syscall_table[__NR_ia32_close],
-                ia32_syscall_table[__NR_ia32_exit_group],
-                ia32_syscall_table[__NR_ia32_rt_sigaction]);
+                efrm_compat_syscall_table[__NR_ia32_close],
+                efrm_compat_syscall_table[__NR_ia32_exit_group],
+                efrm_compat_syscall_table[__NR_ia32_rt_sigaction]);
   }
 #endif
 

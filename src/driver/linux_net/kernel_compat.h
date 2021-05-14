@@ -37,6 +37,7 @@
 #include <linux/jhash.h>
 #include <linux/ktime.h>
 #include <linux/ctype.h>
+#include <linux/aer.h>
 #ifdef CONFIG_SFC_MTD
 /* This is conditional because it's fairly disgusting */
 #include "linux_mtd_mtd.h"
@@ -125,6 +126,21 @@
 
 #ifndef raw_smp_processor_id
 	#define raw_smp_processor_id() (current_thread_info()->cpu)
+#endif
+
+#ifndef fallthrough
+#ifdef __has_attribute
+#ifndef __GCC4_has_attribute___fallthrough__
+#define __GCC4_has_attribute___fallthrough__	0
+#endif
+#if __has_attribute(__fallthrough__)
+# define fallthrough                    __attribute__((__fallthrough__))
+#else
+# define fallthrough                    do {} while (0)  /* fallthrough */
+#endif
+#else
+# define fallthrough                    do {} while (0)  /* fallthrough */
+#endif
 #endif
 
 #ifndef NETIF_F_CSUM_MASK
@@ -1371,7 +1387,11 @@ static inline void netdev_tx_reset_queue(struct netdev_queue *q) {}
 	#if !defined(CONFIG_COMPAT)
 		return 0;
 	#elif defined(CONFIG_X86_64)
+		#if defined(EFX_HAVE_TIF_ADDR32)
+		return test_thread_flag(TIF_ADDR32);
+		#else
 		return test_thread_flag(TIF_IA32);
+		#endif
 	#elif defined(CONFIG_PPC64)
 		return test_thread_flag(TIF_32BIT);
 	#else
@@ -1599,6 +1619,10 @@ static inline struct tcphdr *inner_tcp_hdr(const struct sk_buff *skb)
 #endif /* !NETIF_F_GSO_GRE */
 #endif /* EFX_HAVE_SKB_ENCAPSULATION */
 
+#ifndef EFX_HAVE_PCI_CHANNEL_STATE_T
+#define	pci_channel_state_t	enum pci_channel_state
+#endif
+
 #ifndef EFX_HAVE_ETHTOOL_LINKSETTINGS
 /* We use an array of size 1 so that legacy code using index [0] will
  * work with both this and a real link_mode_mask.
@@ -1614,6 +1638,13 @@ static inline bool mod_delayed_work(struct workqueue_struct *wq,
 	cancel_delayed_work(dwork);
 	queue_delayed_work(wq, dwork, delay);
 	return true;
+}
+#endif
+
+#ifdef EFX_NEED_PCI_AER_CLEAR_NONFATAL_STATUS
+static inline int pci_aer_clear_nonfatal_status(struct pci_dev *dev)
+{
+	return pci_cleanup_aer_uncorrect_error_status(dev);
 }
 #endif
 
@@ -1906,9 +1937,6 @@ unsigned int cpumask_local_spread(unsigned int i, int node);
 	#define vlan_gro_receive(_napi, _group, _tag, _skb)	\
 		({ vlan_gro_receive(_napi, _group, _tag, _skb);	\
 		   GRO_MERGED; })
-#endif
-#if defined(EFX_USE_GRO) && !defined(EFX_HAVE_NAPI_GRO_BITMASK)
-#define gro_bitmask	gro_list
 #endif
 
 #ifdef EFX_NEED_HEX_DUMP_CONST_FIX
@@ -2716,6 +2744,13 @@ struct EFX_HWMON_DEVICE_REGISTER_TYPE *hwmon_device_register_with_info(
 #define HWMON_T_ALARM	BIT(hwmon_temp_alarm)
 #endif
 #endif
+/* For RHEL 6 and 7 the above takes care of hwmon_device_register_with_info(),
+ * but they are missing the read_string() API in struct hwmon_ops.
+ */
+#if defined(HWMON_T_MIN) && (defined(EFX_HAVE_HWMON_READ_STRING) ||	\
+			     defined(EFX_HAVE_HWMON_READ_STRING_CONST))
+#define EFX_HAVE_HWMON_DEVICE_REGISTER_WITH_INFO
+#endif
 
 #if defined(EFX_HAVE_XDP_EXT)
 /* RHEL 7 adds the XDP related NDOs in the net_device_ops_extended area.
@@ -2751,6 +2786,10 @@ struct EFX_HWMON_DEVICE_REGISTER_TYPE *hwmon_device_register_with_info(
 
 #if !defined(EFX_HAVE_XDP_HEAD) && !defined(XDP_PACKET_HEADROOM)
 #define XDP_PACKET_HEADROOM 0
+#endif
+
+#ifndef EFX_HAVE_XDP_RXQ_INFO_NAPI_ID
+#define xdp_rxq_info_reg(_i,_d,_q,_n)	xdp_rxq_info_reg(_i,_d,_q)
 #endif
 
 #ifdef EFX_NEED_VOID_SKB_PUT

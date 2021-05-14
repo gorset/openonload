@@ -55,7 +55,6 @@ void ci_netif_state_init(ci_netif* ni, int cpu_khz, const char* name)
 {
   ci_netif_state_nic_t* nn;
   ci_netif_state* nis = ni->state;
-  struct timespec timetemp;
   int nic_i;
   int i;
 
@@ -189,8 +188,7 @@ void ci_netif_state_init(ci_netif* ni, int cpu_khz, const char* name)
   nis->pid = task_pid_vnr(current);
 #endif
 
-  getnstimeofday(&timetemp);
-  nis->creation_time_sec = timetemp.tv_sec;
+  nis->creation_time_sec = get_seconds();
 #if CI_CFG_FD_CACHING
   nis->passive_cache_avail_stack = nis->opts.sock_cache_max;
 #endif
@@ -410,7 +408,7 @@ ci_setup_ipstack_params(void)
       ci_log("ERROR: failed to open "CI_CFG_PROC_PATH"net/ipv4");
       return -1;
     }
-    close(fd);
+    ci_sys_close(fd);
   }
   /* We will re-read following values in kernel mode for every socket,
    * but we need them before the first socket is initialized. */
@@ -652,6 +650,14 @@ void ci_netif_config_opts_rangecheck(ci_netif_config_opts* opts)
 }                                               
 
 # include <ci/internal/opts_netif_def.h>
+
+  /* EF_MAX_ENDPOINTS should must be divisible by 4 */
+  if( opts->max_ep_bufs % EP_BUF_PER_PAGE != 0 ) {
+    unsigned new_max = opts->max_ep_bufs;
+    new_max = CI_ROUND_UP(new_max, EP_BUF_PER_PAGE);
+    ci_log("config: EF_MAX_ENDPOINTS is rounded up from %u to %u", opts->max_ep_bufs, new_max);
+    opts->max_ep_bufs = new_max;
+  }
 }
 
 #ifdef __KERNEL__
@@ -1042,6 +1048,8 @@ void ci_netif_config_opts_getenv(ci_netif_config_opts* opts)
     opts->rst_delayed_conn = atoi(s);
   if( (s = getenv("EF_TCP_SNDBUF_MODE")) )
     opts->tcp_sndbuf_mode = atoi(s);
+  if( (s = getenv("EF_TCP_COMBINE_SENDS_MODE")) )
+    opts->tcp_combine_sends_mode = atoi(s);
   if( (s = getenv("EF_TCP_SEND_NONBLOCK_NO_PACKETS_MODE")) )
     opts->tcp_nonblock_no_pkts_mode = atoi(s);
   if( (s = getenv("EF_TCP_RCVBUF_STRICT")) )
@@ -2079,7 +2087,7 @@ static int netif_tcp_helper_build(ci_netif* ni)
 
     /* Get interface properties. */
     rc = oo_cp_get_hwport_properties(ni->cplane, ns->intf_i_to_hwport[nic_i],
-                                     NULL, NULL);
+                                     NULL, NULL, NULL);
     if( rc < 0 )
       goto fail1;
 

@@ -64,7 +64,9 @@ extern void tcp_helper_suspend_interface(ci_netif* ni, int intf_i);
 extern void tcp_helper_reset_stack(ci_netif* ni, int intf_i);
 
 #if CI_CFG_WANT_BPF_NATIVE && CI_HAVE_BPF_NATIVE
-extern void tcp_helper_xdp_change(ci_netif* ni, int intf_i);
+extern void tcp_helper_handle_xdp_change(tcp_helper_resource_t *thr,
+                                         int intf_i,
+                                         cp_xdp_prog_id_t xdp_prog_id);
 #endif
 
 extern void tcp_helper_flush_resets(ci_netif* ni);
@@ -86,9 +88,9 @@ extern void tcp_helper_rm_dump(int fd_type, oo_sp sock_id,
   tcp_helper_rm_dump((priv)->fd_type, (priv)->sock_id,  \
                      (priv)->thr, line_prefix)
 
-extern unsigned efab_tcp_helper_netif_lock_callback(eplock_helper_t*,
-                                                    ci_uint64 lock_val,
-                                                    int in_dl_context);
+extern ci_uint64 efab_tcp_helper_netif_lock_callback(eplock_helper_t*,
+                                                     ci_uint64 lock_val,
+                                                     int in_dl_context);
 
 extern int efab_ioctl_get_ep(ci_private_t*, oo_sp,
                              tcp_helper_endpoint_t** ep_out);
@@ -507,10 +509,10 @@ efab_get_os_settings(tcp_helper_resource_t* trs)
 
   /* Linux 4.15 moved these values into network namespace structures */
 #if defined(EFRM_DO_NAMESPACES) && defined(EFRM_HAVE_NS_SYSCTL_TCP_MEM)
-  opts->tcp_sndbuf_def = trs->nsproxy->net_ns->ipv4.sysctl_tcp_wmem[1];
-  opts->tcp_sndbuf_max = trs->nsproxy->net_ns->ipv4.sysctl_tcp_wmem[2];
-  opts->tcp_rcvbuf_def = trs->nsproxy->net_ns->ipv4.sysctl_tcp_rmem[1];
-  opts->tcp_rcvbuf_max = trs->nsproxy->net_ns->ipv4.sysctl_tcp_rmem[2];
+  opts->tcp_sndbuf_def = thr_net_ns(trs)->ipv4.sysctl_tcp_wmem[1];
+  opts->tcp_sndbuf_max = thr_net_ns(trs)->ipv4.sysctl_tcp_wmem[2];
+  opts->tcp_rcvbuf_def = thr_net_ns(trs)->ipv4.sysctl_tcp_rmem[1];
+  opts->tcp_rcvbuf_max = thr_net_ns(trs)->ipv4.sysctl_tcp_rmem[2];
 #elif defined(EFRM_HAVE_NS_SYSCTL_TCP_MEM)
   opts->tcp_sndbuf_def = init_net.ipv4.sysctl_tcp_wmem[1];
   opts->tcp_sndbuf_max = init_net.ipv4.sysctl_tcp_wmem[2];

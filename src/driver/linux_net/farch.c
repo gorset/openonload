@@ -3412,7 +3412,7 @@ bool efx_farch_filter_rfs_expire_one(struct efx_nic *efx, u32 flow_id,
 	struct efx_farch_filter_state *state = efx->filter_state;
 	struct efx_farch_filter_table *table;
 	bool ret = false, force = false;
-	u16 arfs_id;
+	u16 arfs_id = 0;
 
 	down_write(&state->lock);
 	spin_lock_bh(&efx->rps_hash_lock);

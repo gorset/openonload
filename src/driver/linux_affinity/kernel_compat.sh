@@ -13,6 +13,7 @@ function generate_kompat_symbols() {
 EFRM_HAVE_PROC_CREATE		symtype	proc_create	include/linux/proc_fs.h struct proc_dir_entry *(const char *name, mode_t mode, struct proc_dir_entry *parent, const struct file_operations *proc_fops)
 EFRM_HAVE_PROC_CREATE_DATA	symtype	proc_create_data	include/linux/proc_fs.h struct proc_dir_entry *(const char *name, mode_t mode, struct proc_dir_entry *parent, const struct file_operations *proc_fops, void *data)
 EFRM_HAVE_PROC_CREATE_DATA_UMODE	symtype	proc_create_data	include/linux/proc_fs.h struct proc_dir_entry *(const char *name, umode_t mode, struct proc_dir_entry *parent, const struct file_operations *proc_fops, void *data)
+EFRM_HAVE_PROC_CREATE_DATA_PROC_OPS    symtype proc_create_data        include/linux/proc_fs.h struct proc_dir_entry *(const char *name, umode_t mode, struct proc_dir_entry *parent, const struct proc_ops *proc_fops, void *data)
 EFRM_HAVE_PDE_DATA		symtype	PDE_DATA	include/linux/proc_fs.h void *(const struct inode *inode)
 
 EFRM_HAVE_NSPROXY		file	include/linux/nsproxy.h
@@ -47,7 +48,7 @@ EFRM_HAVE_WQ_SYSFS	symbol	WQ_SYSFS	include/linux/workqueue.h
 EFRM_HAVE_POLL_REQUESTED_EVENTS	symbol	poll_requested_events	include/linux/poll.h
 EFRM_POLL_TABLE_HAS_OLD_KEY	memtype	struct_poll_table_struct	key	include/linux/poll.h	unsigned long
 
-ERFM_HAVE_NEW_KALLSYMS	symtype	kallsyms_on_each_symbol	include/linux/kallsyms.h int(int (*)(void *, const char *, struct module *, unsigned long), void *)
+ERFM_HAVE_NEW_KALLSYMS	export	kallsyms_on_each_symbol	include/linux/kallsyms.h	kernel/kallsyms.c
 
 EFRM_HAVE_TASK_NSPROXY	symbol	task_nsproxy	include/linux/nsproxy.h
 
@@ -104,8 +105,6 @@ EFRM_HAVE_KMEM_CACHE_CACHEP		symtype	kmem_cache_create	include/linux/slab.h stru
 EFRM_NET_HAS_PROC_INUM			member	struct_net proc_inum	include/net/net_namespace.h
 EFRM_NET_HAS_USER_NS			member	struct_net user_ns	include/net/net_namespace.h
 
-EFRM_HAVE_PRANDOM_U32			symbol  prandom_u32             include/linux/random.h
-
 EFRM_HAVE_OLD_FAULT			memtype struct_vm_operations_struct	fault	include/linux/mm.h	int (*)(struct vm_area_struct *vma, struct vm_fault *vmf)
 EFRM_HAVE_NEW_FAULT			memtype struct_vm_operations_struct	fault	include/linux/mm.h	vm_fault_t (*)(struct vm_fault *vmf)
 
@@ -142,9 +141,6 @@ EFRM_HAVE_RBTREE                        symbol rb_link_node_rcu include/linux/rb
 EFRM_HAVE_SKB_METADATA                  symbol skb_metadata_len include/linux/skbuff.h
 EFRM_HAVE_BIN2HEX                       symbol bin2hex include/linux/kernel.h
 EFRM_HAVE_ALLSYMS_SHOW_VALUE            symbol kallsyms_show_value include/linux/kallsyms.h
-EFRM_HAVE_PRANDOM_INIT_ONCE             symbol prandom_init_once include/linux/random.h
-EFRM_HAVE_PRANDOM_U32_STATE             symbol prandom_u32_state include/linux/random.h
-EFRM_PRANDOM_SEED_FULL_EXPORT           export prandom_seed_full_state include/linux/random.h lib/random32.c
 EFRM_HAVE_ARRAY_SIZE                    symbol array_size include/linux/overflow.h
 EFRM_HAVE_WRITE_ONCE                    symbol WRITE_ONCE include/linux/compiler.h
 EFRM_HAVE_INIT_LIST_HEAD_RCU            symbol INIT_LIST_HEAD_RCU include/linux/rculist.h
@@ -170,6 +166,23 @@ EFRM_HAVE_FILE_INODE			symbol file_inode include/linux/fs.h
 
 EFRM_HAVE_UNMAP_KERNEL_RANGE	export	unmap_kernel_range	include/linux/vmalloc.h	mm/vmalloc.c
 
+EFRM_HAVE_PRANDOM_U32		symbol	prandom_u32	include/linux/random.h
+EFRM_HAVE_GET_RANDOM_LONG	symbol	get_random_long	include/linux/random.h
+
+EFRM_HAS_STRUCT_TIMEVAL		member	struct_timeval	tv_sec	include/linux/time.h
+EFRM_HAS_STRUCT_TIMESPEC64	member	struct_timespec64	tv_sec	include/linux/time.h
+EFRM_HAS_KTIME_GET_TS64		symbol	ktime_get_ts64	include/linux/timekeeping.h
+
+EFRM_HAVE_STRUCT_PROC_OPS	member	struct_proc_ops	proc_open	include/linux/proc_fs.h
+
+EFRM_HAVE_MMAP_LOCK_WRAPPERS		file	include/linux/mmap_lock.h
+
+EFRM_HAVE_SOCK_BINDTOINDEX		symbol	sock_bindtoindex	include/net/sock.h
+
+EFRM_HAVE_ALLOC_VM_AREA_WITH_PTES	symtype	alloc_vm_area	include/linux/vmalloc.h	struct vm_struct* (size_t, pte_t **)
+
+EFRM_MSGHDR_HAS_MSG_CONTROL_USER	member	struct_msghdr	msg_control_user	include/linux/socket.h
+EFRM_HAS_SOCKPTR		symbol	KERNEL_SOCKPTR	include/linux/sockptr.h
 
 # TODO move onload-related stuff from net kernel_compat
 " | egrep -v -e '^#' -e '^$' | sed 's/[ \t][ \t]*/:/g'
